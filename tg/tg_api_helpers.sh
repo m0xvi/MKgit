@@ -111,6 +111,22 @@ tg_get_updates() {
     tg_api_call "GET" "getUpdates?offset=${1:-0}&timeout=${2:-60}"
 }
 
+# --- Callback answer (убирает "часики" на кнопке) ---
+tg_answer_callback() {
+    local cb_id="${1:-}"
+    [ -n "$cb_id" ] || return 0
+    tg_api_call "POST" "answerCallbackQuery" \
+        "{\"callback_query_id\":\"$cb_id\"}" > /dev/null 2>&1
+}
+
+# --- Очистить inline-клавиатуру у сообщения (чтобы нельзя было нажать дважды) ---
+tg_clear_keyboard() {
+    local chat_id="${1:-}" msg_id="${2:-}"
+    [ -n "$msg_id" ] || return 0
+    tg_api_call "POST" "editMessageReplyMarkup" \
+        "{\"chat_id\":\"$chat_id\",\"message_id\":\"$msg_id\",\"reply_markup\":{}}" > /dev/null 2>&1
+}
+
 # --- Connection Test ---
 tg_test_connection() {
     tg_api_log "INFO" "========== Testing Telegram API =========="
@@ -156,3 +172,4 @@ tg_test_connection() {
 }
 
 tg_api_log "INFO" "Helpers loaded. https_proxy=${https_proxy:-DIRECT}"
+

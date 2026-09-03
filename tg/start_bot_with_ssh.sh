@@ -59,3 +59,4 @@ fi
 # --- Start the bot ---
 echo "[$(date)] Launching bot..."
 exec "$SCRIPT_DIR/mk_tg_bot.sh"
+

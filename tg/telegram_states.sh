@@ -67,3 +67,4 @@ get_user_data() {
 cleanup_stale_states() {
     find "$STATE_DIR" -type f -mmin +60 -delete 2>/dev/null
 }
+

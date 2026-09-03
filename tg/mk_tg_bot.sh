@@ -28,6 +28,13 @@ if [ -f "$SCRIPT_DIR/telegram_states.sh" ]; then
     source "$SCRIPT_DIR/telegram_states.sh"
 fi
 
+# --- Load RouterOS update manager (library: функции rup_*) ---
+if [ -f "$SCRIPT_DIR/mk_updates.sh" ]; then
+    source "$SCRIPT_DIR/mk_updates.sh"
+else
+    echo "ERROR: mk_updates.sh not found" >&2
+fi
+
 # --- Colors ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -398,6 +405,7 @@ show_menu() {
         [{"text": "📊 Status", "callback_data": "status"}, {"text": "📥 Download", "callback_data": "download_menu"}],
         [{"text": "🔄 Backup All", "callback_data": "backup_all"}, {"text": "🔧 Backup Device", "callback_data": "backup_menu"}],
         [{"text": "📋 List Devices", "callback_data": "list_devices"}, {"text": "🔑 SSH Keys", "callback_data": "ssh_keys_menu"}],
+        [{"text": "⬆️ Обновления RouterOS", "callback_data": "upd_menu"}],
         [{"text": "➕ Add Device", "callback_data": "add_device"}]
     ]'
     tg_send_keyboard "$TELEGRAM_CHAT_ID" "🤖 <b>MikroTik Backup Bot</b>\nChoose an action:" "$keyboard"
@@ -434,6 +442,64 @@ show_download_menu() {
     keyboard+='[{"text": "🔙 Back", "callback_data": "menu"}]'
     keyboard+=']'
     tg_send_keyboard "$TELEGRAM_CHAT_ID" "📥 <b>Select device:</b>" "$keyboard"
+}
+
+# =============================================================================
+# ROUTEROS UPDATES (см. mk_updates.sh)
+# =============================================================================
+
+# Запуск фонового worker'а обновлений (не блокирует цикл опроса)
+rup_spawn() {
+    nohup bash "$SCRIPT_DIR/mk_updates.sh" "$@" >> "$LOG_FILE" 2>&1 &
+    log "Update worker spawned: mk_updates.sh $*"
+}
+
+show_updates_menu() {
+    local keyboard='[
+        [{"text": "🔎 Проверить сейчас (все)", "callback_data": "upd_check_all"}],
+        [{"text": "📋 Последний статус", "callback_data": "upd_status"}],
+        [{"text": "🔙 Back", "callback_data": "menu"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "⬆️ <b>Обновления RouterOS</b>\n\n• Проверка идёт через сам роутер (<code>/system package update</code>)\n• Перед установкой создаётся резервная копия (MikroGit)\n• Установка — только после вашего подтверждения и требует перезагрузки устройства\n• Обновление — в рамках текущей ветки (6.x или 7.x)\n\nВыберите действие:" "$keyboard"
+}
+
+start_update_check() {
+    log "Manual update check requested"
+    tg_send_message "$TELEGRAM_CHAT_ID" "🔎 <b>Запускаю проверку обновлений…</b>\nРезультат придёт в чат в течение нескольких секунд/минут."
+    rup_spawn check all
+}
+
+ask_install_update() {
+    local dname="$1"
+    local tsvinfo detail="" s inst latest
+    tsvinfo=$(grep -P "^$dname\t" "$(rup_state_dir)/last_check.tsv" 2>/dev/null | head -1)
+    if [ -n "$tsvinfo" ]; then
+        IFS=$'\t' read -r _ s _ inst latest _ _ <<< "$tsvinfo"
+        detail="\n📦 $inst → <b>${latest:-?}</b>"
+    fi
+    local keyboard='[
+        [{"text": "✅ Подтвердить и обновить", "callback_data": "upd_confirm_'"$dname"'"}],
+        [{"text": "❌ Отмена", "callback_data": "upd_cancel_'"$dname"'"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "⚠️ <b>Подтвердите установку RouterOS</b> на <b>$dname</b>$detail\n\n• Сначала будет сделана резервная копия конфигурации\n• Роутер <b>перезагрузится</b> (~2–5 минут недоступности)\n• Обновление — в рамках текущей ветки\n\nПродолжить?" "$keyboard"
+}
+
+confirm_install_update() {
+    local dname="$1"
+    # Уже идёт установка на это устройство?
+    if [ -d "$(rup_state_dir)/lock_apply_$dname" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ На устройстве <b>$dname</b> уже выполняется установка. Дождитесь завершения."
+        return 1
+    fi
+    log "Confirm update install: $dname"
+    tg_send_message "$TELEGRAM_CHAT_ID" "🔄 <b>$dname</b>: запускаю установку RouterOS…\nХод выполнения буду присылать сюда."
+    rup_spawn apply "$dname"
+}
+
+cancel_install_update() {
+    local dname="$1"
+    log "Update install cancelled: $dname"
+    tg_send_message "$TELEGRAM_CHAT_ID" "❌ Установка на <b>$dname</b> отменена."
 }
 
 # =============================================================================
@@ -478,6 +544,12 @@ process_update() {
 
     # --- Callback queries ---
     if [ -n "$callback_data" ]; then
+        # Снимаем "часики" с кнопки у всех callback'ов
+        local cb_id cb_msg_id
+        cb_id=$(echo "$update" | jq -r '.callback_query.id // ""')
+        cb_msg_id=$(echo "$update" | jq -r '.callback_query.message.message_id // ""')
+        [ -n "$cb_id" ] && tg_answer_callback "$cb_id"
+
         case "$callback_data" in
             menu)               clear_user_state "$chat_id"; show_menu ;;
             status)             get_backup_status ;;
@@ -487,6 +559,30 @@ process_update() {
             ssh_keys_menu)      show_ssh_keys_menu ;;
             download_menu)      show_download_menu ;;
             download_all_latest) send_latest_backups ;;
+
+            # --- RouterOS updates ---
+            upd_menu)           show_updates_menu ;;
+            upd_check_all)      start_update_check ;;
+            upd_status)         rup_print_cached_status ;;
+            upd_install_*)
+                local dname=${callback_data#upd_install_}
+                if [[ "$dname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    ask_install_update "$dname"
+                fi ;;
+            upd_confirm_*)
+                local dname=${callback_data#upd_confirm_}
+                if [[ "$dname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    confirm_install_update "$dname"
+                fi ;;
+            upd_cancel_*)
+                local dname=${callback_data#upd_cancel_}
+                if [[ "$dname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    cancel_install_update "$dname"
+                fi ;;
+
             download_list_*)
                 local dname=${callback_data#download_list_}
                 list_backups_for_download "$dname" ;;
@@ -520,6 +616,8 @@ process_update() {
     if [ -n "$message_text" ]; then
         case "$message_text" in
             /start|/menu)   clear_user_state "$chat_id"; show_menu ;;
+            /updates)       show_updates_menu ;;
+            /checkupdates)  show_updates_menu ;;
             /cancel)        cancel_device_addition "$chat_id" ;;
             /status)        get_backup_status ;;
             /backup)        show_backup_menu ;;
@@ -585,6 +683,9 @@ run_bot() {
 
         # Clean stale states periodically
         cleanup_stale_states 2>/dev/null || true
+
+        # Автопроверка обновлений по расписанию (не блокирует цикл)
+        rup_maybe_auto_check 2>/dev/null || true
     done
 }
 
@@ -612,3 +713,4 @@ main() {
 }
 
 main "$@"
+
