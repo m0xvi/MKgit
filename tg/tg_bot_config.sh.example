@@ -1,0 +1,43 @@
+#!/bin/bash
+# =============================================================================
+# Telegram Bot Configuration for MikroTik Backup Bot
+# =============================================================================
+
+# --- Telegram Bot Settings ---
+# IMPORTANT: Store token securely! Consider using a vault or restricted file.
+export TELEGRAM_BOT_TOKEN=""
+export TELEGRAM_CHAT_ID=""
+
+# --- Paths ---
+export CONFIG_FILE="/home/aionis/MikroGit/devices.conf"
+export BACKUP_SCRIPT="/home/aionis/MikroGit/MikroGit.sh"
+export LOG_FILE="/home/aionis/MikroGit/logs/mk_backup.log"
+
+# --- Proxy Settings (REQUIRED for Russia) ---
+# Supported types: http, socks5, socks5h
+# Format: protocol://[user:pass@]host:port
+#
+# Examples:
+#   HTTP proxy:
+#     export TELEGRAM_PROXY="http://proxy.example.com:8080"
+#   SOCKS5 proxy:
+#     export TELEGRAM_PROXY="socks5://proxy.example.com:1080"
+#   SOCKS5 with hostname resolution on proxy side:
+#     export TELEGRAM_PROXY="socks5h://proxy.example.com:1080"
+#   Authenticated proxy:
+#     export TELEGRAM_PROXY="http://user:pass@proxy.example.com:8080"
+#
+# Also respected (by curl natively):
+#   export HTTPS_PROXY="socks5h://proxy.example.com:1080"
+#   export HTTP_PROXY="http://proxy.example.com:8080"
+#   export ALL_PROXY="socks5://proxy.example.com:1080"
+#
+export TELEGRAM_PROXY=""
+
+# --- Retry Settings ---
+export TG_MAX_RETRIES=3
+export TG_RETRY_DELAY=2
+export TG_TIMEOUT=30
+
+# --- SSH Key ---
+export SSH_KEY="$HOME/.ssh/mk_key"
