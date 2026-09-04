@@ -21,8 +21,10 @@ set_user_state() {
 
 get_user_state() {
     local user_id="$1"
+    # ВАЖНО: при set -u обращение к несуществующему ключу ассоциативного массива
+    # даёт "unbound variable". Используем "${var[key]:-}", чтобы безопасно вернуть "".
     # Check memory first, fall back to disk
-    if [ -n "${USER_STATES[$user_id]}" ]; then
+    if [ -n "${USER_STATES[$user_id]:-}" ]; then
         echo "${USER_STATES[$user_id]}"
     elif [ -f "$STATE_DIR/user_${user_id}_state" ]; then
         USER_STATES["$user_id"]=$(cat "$STATE_DIR/user_${user_id}_state")
@@ -56,7 +58,7 @@ set_user_data() {
 get_user_data() {
     local user_id="$1"
     local key="$2"
-    if [ -n "${USER_DATA[${user_id}_${key}]}" ]; then
+    if [ -n "${USER_DATA[${user_id}_${key}]:-}" ]; then
         echo "${USER_DATA[${user_id}_${key}]}"
     else
         echo ""
@@ -67,4 +69,3 @@ get_user_data() {
 cleanup_stale_states() {
     find "$STATE_DIR" -type f -mmin +60 -delete 2>/dev/null
 }
-

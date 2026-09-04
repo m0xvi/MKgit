@@ -42,6 +42,15 @@ UPDATE_REBOOT_WAIT="${UPDATE_REBOOT_WAIT:-600}"
 # Задержка между попытками опроса после reboot (сек)
 UPDATE_REBOOT_POLL="${UPDATE_REBOOT_POLL:-10}"
 
+# Таймаут на одну SSH-команду при "коротких" операциях (resource/print/routerboard),
+# сек. Защищает от зависания, если роутер отвечает, но команда "висит".
+UPDATE_SSH_TIMEOUT="${UPDATE_SSH_TIMEOUT:-60}"
+
+# Таймаут на check-for-updates: роутер ходит на upgrade.mikrotik.com, при плохом/
+# отсутствующем доступе может висеть долго. По истечении устройство помечается
+# ERROR и проверка идёт дальше.
+UPDATE_CHECK_TIMEOUT="${UPDATE_CHECK_TIMEOUT:-150}"
+
 # Каталог состояния (локи, кеш последней проверки) вычисляется ЛЕНИВО —
 # после загрузки конфигурации (LOG_FILE), чтобы бот и его фоновые worker'ы
 # использовали один и тот же каталог.
@@ -147,18 +156,32 @@ rup_get_line() {
 RUP_SSH_ERR=""
 rup_ssh_exec() {
     # $1 - device_name, $2 - команда RouterOS (один аргумент)
+    # $3 - таймаут команды в сек (0/пусто = без ограничения)
     # stdout команды -> stdout; stderr -> в RUP_SSH_ERR; rc -> rc функции
-    local name="$1" cmd="$2"
+    local name="$1" cmd="$2" tmo="${3:-0}"
     local line ip port user _
     RUP_SSH_ERR=""
     line=$(rup_get_line "$name") || { RUP_SSH_ERR="Устройство '$name' не найдено в devices.conf"; return 2; }
     IFS=':' read -r _ ip port user _ <<< "$line"
 
-    local out
-    # shellcheck disable=SC2086
-    out=$($RUP_SSH_BIN -p "$port" -i "${SSH_KEY:-$HOME/.ssh/mk_key}" $RUP_SSH_OPTS \
-            -o LogLevel=ERROR "$user@$ip" "$cmd" 2>&1)
-    local rc=$?
+    local runner out rc
+    if [ "$tmo" -gt 0 ] 2>/dev/null && command -v timeout > /dev/null 2>&1; then
+        # shellcheck disable=SC2086
+        out=$(timeout "$tmo" "$RUP_SSH_BIN" -p "$port" -i "${SSH_KEY:-$HOME/.ssh/mk_key}" \
+                $RUP_SSH_OPTS -o LogLevel=ERROR "$user@$ip" "$cmd" 2>&1)
+        rc=$?
+    else
+        # shellcheck disable=SC2086
+        out=$($RUP_SSH_BIN -p "$port" -i "${SSH_KEY:-$HOME/.ssh/mk_key}" \
+                $RUP_SSH_OPTS -o LogLevel=ERROR "$user@$ip" "$cmd" 2>&1)
+        rc=$?
+    fi
+
+    # Код 124 = таймаут команды (GNU timeout)
+    if [ "$rc" -eq 124 ]; then
+        RUP_SSH_ERR="таймаут операции на роутере (${tmo}с)"
+        return 124
+    fi
     # RouterOS при обрыве (например, reboot) пишет в stderr текст — не считаем
     # его ошибкой, если rc==0/255 от "Connection closed". rc обычно 255 при
     # закрытии соединения удалённой стороной по reboot.
@@ -256,7 +279,7 @@ rup_check_device() {
     fi
 
     # --- текущая версия (для определения ветки v6/v7) ---
-    out=$(rup_ssh_exec "$name" "/system resource print")
+    out=$(rup_ssh_exec "$name" "/system resource print" "${UPDATE_SSH_TIMEOUT:-60}")
     rc=$?
     if [ $rc -ne 0 ]; then
         detail="Нет SSH-доступа (${RUP_SSH_ERR:-rc=$rc})"
@@ -270,14 +293,20 @@ rup_check_device() {
 
     # --- канал (принудительно, если задан UPDATE_CHANNEL) ---
     if [ -n "$chan_cfg" ]; then
-        rup_ssh_exec "$name" "/system package update set channel=$chan_cfg" > /dev/null 2>&1
+        rup_ssh_exec "$name" "/system package update set channel=$chan_cfg" "${UPDATE_SSH_TIMEOUT:-60}" > /dev/null 2>&1
     fi
 
     # --- запрос обновлений к серверам MikroTik ---
-    out=$(rup_ssh_exec "$name" $'/system package update check-for-updates\n/system package update print')
+    # check-for-updates может идти долго (роутер ходит на upgrade.mikrotik.com),
+    # поэтому ограничиваем по времени, чтобы одно устройство не блокировало все.
+    out=$(rup_ssh_exec "$name" $'/system package update check-for-updates\n/system package update print' "${UPDATE_CHECK_TIMEOUT:-150}")
     rc=$?
     if [ $rc -ne 0 ]; then
-        detail="Ошибка check-for-updates (${RUP_SSH_ERR:-rc=$rc})"
+        if [ "$rc" -eq 124 ]; then
+            detail="check-for-updates не ответил за ${UPDATE_CHECK_TIMEOUT:-150}с (нет доступа роутера к upgrade.mikrotik.com?)"
+        else
+            detail="Ошибка check-for-updates (${RUP_SSH_ERR:-rc=$rc})"
+        fi
         detail=$(rup_tsv_escape_detail "$detail")
         echo -e "$name\tERROR\t$major\t$cur_ver\t-\t$chan_cfg\t$detail"
         return 1
@@ -373,8 +402,6 @@ rup_worker_check() {
         return 1
     fi
 
-    rup_send "🔎 <b>Проверка обновлений RouterOS…</b>"
-
     if [ "$scope" = "all" ]; then
         local cfg
         cfg=$(rup_cfg_file)
@@ -395,49 +422,45 @@ rup_worker_check() {
         return 1
     fi
 
-    local all_tsv="" n=0 total=${#names[@]}
+    local total=${#names[@]}
+    rup_send "🔎 <b>Проверка обновлений RouterOS…</b> (устройств: $total)
+Результат по каждому устройству придёт отдельным сообщением по мере проверки."
+
+    local all_tsv="" n=0
     local upd_buttons="["
     local html=""
+    local have_any=0
 
     for name in "${names[@]}"; do
         n=$((n+1))
+        # Сразу показываем прогресс, чтобы не казалось, что бот завис
+        rup_send "⏳ [$n/$total] <b>$name</b>: проверяю…"
         tsv=$(rup_check_device "$name")
-        all_tsv+="$tsv"$'\n'
-        html+="$(rup_report_line_html "$tsv")"$'\n'
         IFS=$'\t' read -r _ status _ _ _ _ _ <<< "$tsv"
+        all_tsv+="$tsv"$'\n'
+        # Результат по устройству — сразу
+        rup_send "$(rup_report_line_html "$tsv")"
+        rup_log "check $name -> $(echo "$tsv" | tr '\t' '|')"
         if [ "$status" = "UPDATE" ]; then
+            have_any=1
             upd_buttons+='[{"text":"⬇️ Установить: '"$name"'","callback_data":"upd_install_'"$name"'"}],'
         fi
-        # лог по каждому устройству
-        rup_log "check $name -> $(echo "$tsv" | tr '\t' '|')"
+        # Небольшая пауза, чтобы не упереться в rate limit Telegram
+        sleep 1
     done
 
     # Кеш последней проверки (для мгновенного /status)
     printf '%s' "$all_tsv" > "$(rup_state_dir)/last_check.tsv" 2>/dev/null
 
-    local header="📊 <b>Результат проверки обновлений</b> (${n}/$total)"
-    header+=$'\n'"$(rup_report_summary "$all_tsv")"$'\n\n'
-    html="$header$html"
-
-    # Отправка частями (лимит 4096)
-    local chunk="" line_html
-    while IFS= read -r line_html; do
-        [ -z "$line_html" ] && continue
-        if [ $(( ${#chunk} + ${#line_html} + 1 )) -gt 3800 ]; then
-            rup_send "$chunk"
-            chunk=""
-        fi
-        chunk+="$line_html"$'\n'
-    done <<< "$html"
-    if [ -n "$chunk" ]; then rup_send "$chunk"; fi
+    # Сводка
+    rup_send "📊 <b>Итог проверки</b> (${n}/$total)
+$(rup_report_summary "$all_tsv")"
 
     # Кнопки установки (если есть обновления)
-    if [ "$upd_buttons" != "[" ]; then
+    if [ "$have_any" = "1" ]; then
         upd_buttons+='[{"text":"📋 Меню","callback_data":"menu"}]'
         upd_buttons+=']'
         rup_send_keyboard "⬇️ <b>Доступны обновления</b> — нажмите на устройство для подтверждения установки:" "$upd_buttons"
-    else
-        rup_send "✅ Все проверенные устройства в актуальном состоянии."
     fi
 
     rup_lock_release "check"
@@ -521,32 +544,27 @@ rup_worker_apply() {
 
     # 3. Принудительно ставим канал (если задан)
     if [ -n "$UPDATE_CHANNEL" ]; then
-        rup_ssh_exec "$name" "/system package update set channel=$UPDATE_CHANNEL" > /dev/null 2>&1 \
+        rup_ssh_exec "$name" "/system package update set channel=$UPDATE_CHANNEL" "${UPDATE_SSH_TIMEOUT:-60}" > /dev/null 2>&1 \
             && rup_log "apply $name: channel=$UPDATE_CHANNEL установлен" || true
     fi
 
     # 4. Скачивание
     rup_send "⬇️ <b>$name</b>: скачиваю RouterOS $latest (канал ${chan:-?}).\nЭто может занять несколько минут…"
     local out rc
-    out=$(timeout "$UPDATE_DOWNLOAD_TIMEOUT" \
-        "$RUP_SSH_BIN" -p "$(rup_get_line "$name" | cut -d: -f3)" -i "${SSH_KEY:-$HOME/.ssh/mk_key}" \
-        $RUP_SSH_OPTS -o LogLevel=ERROR \
-        "$(rup_get_line "$name" | cut -d: -f4)@$(rup_get_line "$name" | cut -d: -f2)" \
-        "/system package update download" 2>&1)
+    out=$(rup_ssh_exec "$name" "/system package update download" "${UPDATE_DOWNLOAD_TIMEOUT:-900}")
     rc=$?
 
     if [ $rc -ne 0 ]; then
         if [ $rc -eq 124 ]; then
             rup_send "❌ <b>$name</b>: таймаут скачивания (${UPDATE_DOWNLOAD_TIMEOUT}с). Проверьте канал/интернет роутера."
         else
-            local e=$(echo "$out" | tail -3 | tr '\n' ' ')
-            rup_send "❌ <b>$name</b>: ошибка скачивания (rc=$rc). $e"
+            rup_send "❌ <b>$name</b>: ошибка скачивания (${RUP_SSH_ERR:-rc=$rc})."
         fi
         rup_lock_release "apply_$name"; trap - EXIT; return 1
     fi
 
     # Небольшая проверка: статус не должен быть "downloading"
-    out=$(rup_ssh_exec "$name" "/system package update print")
+    out=$(rup_ssh_exec "$name" "/system package update print" "${UPDATE_SSH_TIMEOUT:-60}")
     if echo "$out" | grep -qiE "downloading"; then
         rup_send "❌ <b>$name</b>: скачивание не завершилось (статус downloading). Повторите позже."
         rup_lock_release "apply_$name"; trap - EXIT; return 1
@@ -565,7 +583,7 @@ rup_worker_apply() {
     while [ $waited -lt "$UPDATE_REBOOT_WAIT" ]; do
         sleep "$UPDATE_REBOOT_POLL"; waited=$((waited + UPDATE_REBOOT_POLL))
         local v
-        v=$(rup_ssh_exec "$name" "/system resource print" 2>/dev/null | rup_parse_field "version")
+        v=$(rup_ssh_exec "$name" "/system resource print" "${UPDATE_SSH_TIMEOUT:-60}" 2>/dev/null | rup_parse_field "version")
         v=$(rup_ver_clean "$v")
         if [ -n "$v" ]; then up="$v"; break; fi
     done
@@ -585,7 +603,7 @@ rup_worker_apply() {
 
     # 7. Подсказка про RouterBOOT firmware (не обновляем автоматически)
     local rb
-    rb=$(rup_ssh_exec "$name" "/system routerboard print" 2>/dev/null)
+    rb=$(rup_ssh_exec "$name" "/system routerboard print" "${UPDATE_SSH_TIMEOUT:-60}" 2>/dev/null)
     local cf uf
     cf=$(rup_parse_field "$rb" "current-firmware")
     uf=$(rup_parse_field "$rb" "upgrade-firmware")
@@ -666,6 +684,11 @@ rup_main() {
     fi
     mkdir -p "$(dirname "${LOG_FILE:-/tmp/mk_updates.log}")" 2>/dev/null || true
 
+    # PID-файл для контроля живости воркера из бота (start_update_check)
+    rup_ensure_dirs
+    echo "$$" > "$(rup_state_dir)/worker_last.pid" 2>/dev/null || true
+    rup_log "Worker started: $* (pid=$$)"
+
     local action="${1:-}"
     case "$action" in
         check)
@@ -678,6 +701,8 @@ rup_main() {
             echo "Использование: mk_updates.sh {check [all|device] | apply device | status}" >&2
             exit 2 ;;
     esac
+
+    rup_log "Worker finished: $* (pid=$$, rc=$?)"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

@@ -41,3 +41,42 @@ export TG_TIMEOUT=30
 
 # --- SSH Key ---
 export SSH_KEY="$HOME/.ssh/mk_key"
+
+# =============================================================================
+# RouterOS Updates (bot + tg/mk_updates.sh)
+# =============================================================================
+# Проверка обновлений выполняется ЧЕРЕЗ САМ РОУТЕР:
+#   /system package update check-for-updates
+# Требование: у роутера должен быть интернет-доступ к серверам MikroTik
+# (upgrade.mikrotik.com), и SSH-пользователь из devices.conf должен иметь
+# права на /system package update и /system reboot (обычно full admin).
+
+# Канал обновлений. Варианты: stable | long-term | testing | "" (пусто —
+# НЕ менять канал роутера, проверять в том канале, что настроен на самом
+# устройстве). Для единообразия на всех устройствах обычно задают stable.
+export UPDATE_CHANNEL="stable"
+
+# Делать резервную копию конфигурации (MikroGit.sh --device) перед установкой
+export UPDATE_BACKUP_BEFORE_APPLY="1"
+
+# Таймаут скачивания обновления на роутере, сек
+export UPDATE_DOWNLOAD_TIMEOUT="900"
+
+# Сколько ждать возвращения устройства в SSH после перезагрузки, сек
+export UPDATE_REBOOT_WAIT="600"
+
+# Пауза между попытками опроса устройства после перезагрузки, сек
+export UPDATE_REBOOT_POLL="10"
+
+# Таймаут на одну "короткую" SSH-команду (resource print, set channel и т.п.), сек
+export UPDATE_SSH_TIMEOUT="60"
+
+# Таймаут на check-for-updates (роутер ходит на upgrade.mikrotik.com). Если
+# устройство не отвечает за это время — помечается ERROR, проверка идёт дальше.
+export UPDATE_CHECK_TIMEOUT="150"
+
+# Автопроверка обновлений по расписанию (выполняется внутри бота)
+export UPDATE_AUTO_CHECK="1"
+
+# Интервал автопроверки, часы
+export UPDATE_AUTO_INTERVAL_HOURS="24"

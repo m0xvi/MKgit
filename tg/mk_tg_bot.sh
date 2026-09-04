@@ -50,6 +50,44 @@ log()   { echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"; echo "[$(dat
 error() { echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >> "$LOG_FILE"; }
 
 # =============================================================================
+# SINGLE-INSTANCE GUARD
+# =============================================================================
+# Две одновременно работающие копии бота делят long-polling getUpdates и
+# «съедают»/дублируют сообщения (бот молчит, отвечает с ошибками, сбрасывает
+# шаги добавления устройства). Ниже — АТОМАРНАЯ блокировка через flock:
+# вторая копия при старте видит занятый lock и сразу завершается.
+BOT_LOCK_FILE="$(dirname "$LOG_FILE")/mk_tg_bot.lock"
+
+ensure_single_instance() {
+    mkdir -p "$(dirname "$BOT_LOCK_FILE")" 2>/dev/null || true
+    if command -v flock > /dev/null 2>&1; then
+        # Атомарно: fd 9 держим открытым на время жизни процесса,
+        # при выходе процесса ядро само снимает блокировку.
+        exec 9> "$BOT_LOCK_FILE"
+        if ! flock -n 9; then
+            error "Бот уже запущен (lock занят: $BOT_LOCK_FILE). Остановите старый процесс и запустите бота один раз (systemd ИЛИ start_bot_with_ssh.sh)."
+            exit 1
+        fi
+        echo "$$" >&9
+    else
+        # Fallback без flock: проверка pid-файла
+        BOT_PID_FILE="$BOT_LOCK_FILE.pid"
+        if [ -f "$BOT_PID_FILE" ]; then
+            local opid
+            opid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
+            if [ -n "$opid" ] && kill -0 "$opid" 2>/dev/null; then
+                error "Бот уже запущен (pid=$opid). Запустите только один экземпляр."
+                exit 1
+            fi
+            rm -f "$BOT_PID_FILE"
+        fi
+        echo "$$" > "$BOT_PID_FILE"
+        trap 'rm -f "$BOT_PID_FILE"' EXIT
+    fi
+    log "Single-instance lock acquired (pid=$$)"
+}
+
+# =============================================================================
 # BOT FUNCTIONS (using proxy-aware tg_* helpers)
 # =============================================================================
 
@@ -465,8 +503,37 @@ show_updates_menu() {
 
 start_update_check() {
     log "Manual update check requested"
-    tg_send_message "$TELEGRAM_CHAT_ID" "🔎 <b>Запускаю проверку обновлений…</b>\nРезультат придёт в чат в течение нескольких секунд/минут."
+
+    # Считаем устройства, чтобы сразу показать объём работы
+    local cnt=0 line
+    while IFS= read -r line; do
+        [[ "$line" =~ ^# ]] && continue
+        [ -z "$line" ] && continue
+        cnt=$((cnt + 1))
+    done < "${CONFIG_FILE:-/home/aionis/MikroGit/devices.conf}"
+
+    tg_send_message "$TELEGRAM_CHAT_ID" "🔎 <b>Запускаю проверку обновлений…</b>
+Устройств: ${cnt}. Результат по каждому придёт отдельным сообщением.
+Если устройство не отвечает или у него нет доступа к серверам MikroTik, проверка одного роутера может занять до ~2,5 минут (таймаут)."
+
     rup_spawn check all
+
+    # Убеждаемся, что фоновый воркер реально стартовал (pid-файл, до ~6 сек)
+    local alive="" wpid i
+    for i in $(seq 1 12); do
+        wpid=$(cat "$(rup_state_dir)/worker_last.pid" 2>/dev/null || true)
+        if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
+            alive=1
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ "${alive:-0}" != "1" ]; then
+        error "Update worker did not start (check $LOG_FILE)"
+        tg_send_message "$TELEGRAM_CHAT_ID" "⚠️ <b>Фоновая проверка не запустилась.</b>
+Смотрите лог: <code>$LOG_FILE</code>"
+    fi
 }
 
 ask_install_update() {
@@ -519,26 +586,47 @@ process_update() {
         return
     fi
 
-    log "Update - chat=$chat_id text='$message_text' cb='$callback_data'"
+    # Диагностика каждого апдейта: тип (text/callback/other), чтобы по логу
+    # было видно, какие сообщения реально доходят до бота.
+    local upd_type="text"
+    if [ -n "$callback_data" ]; then upd_type="callback"; fi
+    if echo "$update" | jq -e '.message.photo or .message.sticker or .message.document or .message.voice or .message.video' > /dev/null 2>&1; then
+        upd_type="non-text-media"
+    elif [ -n "$message_text" ]; then :;
+    elif [ -z "$callback_data" ]; then upd_type="empty"
+    fi
+    log "Update - chat=$chat_id type=$upd_type text='$message_text' cb='$callback_data'"
 
     # --- Interactive mode (adding device) ---
     local user_state=$(get_user_state "$chat_id")
     if [ -n "$user_state" ] && [ -n "$message_text" ]; then
-        log "Interactive mode - state=$user_state msg=$message_text"
-
-        if [ "$message_text" = "/cancel" ]; then
-            cancel_device_addition "$chat_id"
+        # Команды (начинаются с "/") ВСЕГДА обрабатываются как команды, а не
+        # как очередной шаг ввода. Иначе застрявшее состояние (например, после
+        # рестарта бота посреди добавления устройства) "перехватывает" /menu,
+        # /start и другие команды — и из него невозможно выйти.
+        if [[ "$message_text" == /* ]]; then
+            log "Interactive state ($user_state) прервана командой: $message_text"
+        else
+            log "Interactive mode - state=$user_state msg=$message_text"
+            case "$user_state" in
+                waiting_for_device_name)        handle_device_name "$chat_id" "$message_text" ;;
+                waiting_for_device_ip)          handle_device_ip "$chat_id" "$message_text" ;;
+                waiting_for_device_port)        handle_device_port "$chat_id" "$message_text" ;;
+                waiting_for_device_user)        handle_device_user "$chat_id" "$message_text" ;;
+                waiting_for_device_description) handle_device_description "$chat_id" "$message_text" ;;
+                *) clear_user_state "$chat_id"; show_menu ;;
+            esac
             return
         fi
+    fi
 
-        case "$user_state" in
-            waiting_for_device_name)        handle_device_name "$chat_id" "$message_text" ;;
-            waiting_for_device_ip)          handle_device_ip "$chat_id" "$message_text" ;;
-            waiting_for_device_port)        handle_device_port "$chat_id" "$message_text" ;;
-            waiting_for_device_user)        handle_device_user "$chat_id" "$message_text" ;;
-            waiting_for_device_description) handle_device_description "$chat_id" "$message_text" ;;
-            *) clear_user_state "$chat_id"; show_menu ;;
-        esac
+    # Во время активного ввода пришло НЕ-текстовое сообщение (стикер, фото,
+    # голосовое и т.п.) — по нему шаг ввода не выполняется. Напомним, что
+    # нужен текст, и НЕ сбрасываем состояние (чтобы пользователь мог
+    # продолжить ввод с того же шага).
+    if [ -n "$user_state" ] && [ -z "$message_text" ] && [ -z "$callback_data" ]; then
+        log "Interactive state ($user_state): пришло не-текстовое сообщение — просим текст"
+        tg_send_message "$chat_id" "✍️ Отправьте, пожалуйста, <b>текстом</b> (сейчас бот ждёт ввода на шаге: <code>$user_state</code>).\nКоманда /cancel — отмена."
         return
     fi
 
@@ -649,6 +737,9 @@ process_update() {
 run_bot() {
     log "Starting Telegram Bot..."
     log "Proxy: ${TELEGRAM_PROXY:-none}"
+
+    # Исключаем запуск второй копии бота
+    ensure_single_instance
 
     # Test connection first
     if ! tg_test_connection; then

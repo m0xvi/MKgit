@@ -1,6 +1,6 @@
 /bckp/
 /logs/
 /devices.conf
-/tg/tg-bot-config.sh
 
 tg/tg_bot_config.sh
+/deploy.conf
