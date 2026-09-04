@@ -75,8 +75,54 @@ export UPDATE_SSH_TIMEOUT="60"
 # устройство не отвечает за это время — помечается ERROR, проверка идёт дальше.
 export UPDATE_CHECK_TIMEOUT="150"
 
-# Автопроверка обновлений по расписанию (выполняется внутри бота)
-export UPDATE_AUTO_CHECK="1"
+# Автопроверка обновлений по расписанию (бот сам ходит на роутеры под
+# пользователем из devices.conf — такие входы видны в логах роутера).
+# 0 = выкл: подключения ТОЛЬКО по кнопке/команде (рекомендуется);
+# 1 = вкл (не чаще одного раза в UPDATE_AUTO_INTERVAL_HOURS).
+export UPDATE_AUTO_CHECK="0"
 
-# Интервал автопроверки, часы
+# Интервал автопроверки, часы (используется при UPDATE_AUTO_CHECK="1")
 export UPDATE_AUTO_INTERVAL_HOURS="24"
+
+# =============================================================================
+# Деплой ключа/прав (кнопка «🔑 Деплой ключей/прав» + tg/mk_deploy.sh)
+# =============================================================================
+# Скрипт deploy_key.sh должен лежать рядом с ботом: /home/aionis/MikroGit/tg/
+# (или задайте полный путь ниже).
+export DEPLOY_SCRIPT="/home/aionis/MikroGit/tg/deploy_key.sh"
+
+# Ключи MikroGit: публичный (ставится на роутер) и приватный (для SSH-проверок)
+export DEPLOY_KEY_FILE="/home/aionis/.ssh/mk_key.pub"
+export DEPLOY_KEY_PRIV="/home/aionis/.ssh/mk_key"
+
+# Администраторский вход на роутер для установки ключа и выдачи прав.
+# Транспорт выбирается автоматически (LOGIN_VIA=auto внутри deploy_key.sh):
+# telnet, а если telnet отключён — SSH.
+#   • DEPLOY_TL_PORT — это порт TELNET администратора (обычно 23);
+#   • SSH-порт для входа/проверок берётся ИЗ devices.conf (3-е поле) для
+#     каждого устройства отдельно — глобально его задавать не нужно.
+export DEPLOY_TL_USER="admin"
+export DEPLOY_TL_PORT="23"
+export DEPLOY_TL_PASS=""
+
+# Группа прав пользователя после деплоя. Вместо full — отдельная группа
+# «mikrogit» с МИНИМАЛЬНО необходимыми политиками (DEPLOY_TARGET_POLICY).
+# Если группы на роутере нет — deploy_key.sh создаст её сам. Политики
+# существующей группы не меняются. Пусто = НЕ менять права, только показать.
+export DEPLOY_TARGET_GROUP="mikrogit"
+# Политики группы DEPLOY_TARGET_GROUP (используются при её создании).
+# ssh,read,write,test,reboot,policy — минимум, при котором работают бэкапы и
+# установка обновлений RouterOS из самого роутера. Меняйте осознанно.
+export DEPLOY_TARGET_POLICY="ssh,read,write,test,reboot,policy"
+# Целевой пользователь (пусто = пользователь из 4-го поля devices.conf)
+export DEPLOY_TARGET_USER=""
+# Пароль для СОЗДАВАЕМОГО пользователя (пусто = случайный, будет в логе)
+export DEPLOY_NEWUSER_PASS=""
+
+# 1 = SSH-предпроверка ключом (уже работает — ключ не ставим, но права
+# проверяем/чиним); 0 = всегда полный прогон
+export DEPLOY_SSH_PROBE="1"
+# 1 = после развёртывания подтверждать результат по SSH
+export DEPLOY_SSH_VERIFY="1"
+# Wall-clock лимит на одно устройство, сек
+export DEPLOY_ONE_TIMEOUT="600"

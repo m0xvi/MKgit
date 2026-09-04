@@ -3,4 +3,6 @@
 /devices.conf
 
 tg/tg_bot_config.sh
-/deploy.conf
+tg/deploy.conf
+*.log
+*.patch

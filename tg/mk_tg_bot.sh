@@ -35,6 +35,13 @@ else
     echo "ERROR: mk_updates.sh not found" >&2
 fi
 
+# --- Load key/rights deploy worker (library: функции dep_*) ---
+if [ -f "$SCRIPT_DIR/mk_deploy.sh" ]; then
+    source "$SCRIPT_DIR/mk_deploy.sh"
+else
+    echo "ERROR: mk_deploy.sh not found" >&2
+fi
+
 # --- Colors ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -444,6 +451,7 @@ show_menu() {
         [{"text": "🔄 Backup All", "callback_data": "backup_all"}, {"text": "🔧 Backup Device", "callback_data": "backup_menu"}],
         [{"text": "📋 List Devices", "callback_data": "list_devices"}, {"text": "🔑 SSH Keys", "callback_data": "ssh_keys_menu"}],
         [{"text": "⬆️ Обновления RouterOS", "callback_data": "upd_menu"}],
+        [{"text": "🔑 Деплой ключей/прав", "callback_data": "deploy_menu"}],
         [{"text": "➕ Add Device", "callback_data": "add_device"}]
     ]'
     tg_send_keyboard "$TELEGRAM_CHAT_ID" "🤖 <b>MikroTik Backup Bot</b>\nChoose an action:" "$keyboard"
@@ -639,6 +647,92 @@ cancel_update_all() {
 }
 
 # =============================================================================
+# DEPLOY KEYS / RIGHTS (см. mk_deploy.sh)
+# =============================================================================
+
+# Запуск фонового worker'а деплоя (не блокирует цикл опроса)
+dep_spawn() {
+    nohup bash "$SCRIPT_DIR/mk_deploy.sh" "$@" >> "$LOG_FILE" 2>&1 &
+    log "Deploy worker spawned: mk_deploy.sh $*"
+}
+
+# Занят ли сейчас фоновый деплой?
+dep_busy_now() {
+    [ -d "$(dep_state_dir)/lock_deploy" ]
+}
+
+show_deploy_menu() {
+    local keyboard='['
+    keyboard+='[{"text": "⚡ Развернуть на ВСЕХ (по очереди)", "callback_data": "deploy_all"}],'
+    keyboard+='[{"text": "📜 Последний лог", "callback_data": "deploy_status"}],'
+    local count=0
+    while IFS=':' read -r name ip port user description; do
+        [[ $name =~ ^# ]] || [[ -z $name ]] && continue
+        keyboard+='[{"text": "🔑 '$name'", "callback_data": "deploy_dev_'$name'"}],'
+        ((count++))
+    done < "$CONFIG_FILE"
+    [ $count -eq 0 ] && { tg_send_message "$TELEGRAM_CHAT_ID" "No devices configured!"; return 1; }
+    keyboard+='[{"text": "🔙 Back", "callback_data": "menu"}]'
+    keyboard+=']'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🔑 <b>Деплой ключа MikroGit и прав пользователя</b>\n\n• ставит/обновляет SSH-ключ целевому пользователю (у кого нет);\n• проверяет права НЕ даёт группу full: права доводятся до минимально необходимых — группа <code>mikrogit</code> (создаётся на роутере сама), политики <code>ssh,read,write,test,reboot,policy</code>; хватает для обновлений и бэкапа;\n• вход на роутер — <code>auto</code>: telnet, а если telnet отключён — ssh;\n• работает по одному устройству за раз, по каждому — отчёт.\n\nВыберите действие:" "$keyboard"
+}
+
+ask_deploy_all() {
+    if dep_busy_now; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Деплой уже запущен. Дождитесь завершения (кнопка «📜 Последний лог» покажет прогресс)."
+        return
+    fi
+    local cnt=0 line
+    while IFS= read -r line; do
+        [[ "$line" =~ ^# ]] && continue
+        [ -z "$line" ] && continue
+        cnt=$((cnt + 1))
+    done < "${CONFIG_FILE:-/home/aionis/MikroGit/devices.conf}"
+    local keyboard='[
+        [{"text": "✅ Да, развернуть на всех", "callback_data": "deploy_all_confirm"}],
+        [{"text": "❌ Отмена", "callback_data": "deploy_all_cancel"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "⚡ <b>Развернуть ключ/права на всех устройствах</b> ($cnt)?\nПроцесс пойдёт в фоне, по каждому устройству придёт отчёт." "$keyboard"
+}
+
+confirm_deploy_all() {
+    tg_send_message "$TELEGRAM_CHAT_ID" "⚡ Запускаю деплой на все устройства (по очереди)…"
+    dep_spawn all
+}
+
+cancel_deploy_all() {
+    tg_send_message "$TELEGRAM_CHAT_ID" "❌ Отменено."
+}
+
+ask_deploy_device() {
+    local dname="$1"
+    if dep_busy_now; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Деплой уже запущен. Дождитесь завершения."
+        return
+    fi
+    if [ -z "$dname" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ Не указано устройство."
+        return
+    fi
+    local keyboard='[
+        [{"text": "✅ Развернуть", "callback_data": "deploy_dev_confirm_'$dname'"}],
+        [{"text": "❌ Отмена", "callback_data": "deploy_dev_cancel_'$dname'"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🔑 Развернуть ключ/права на <b>$dname</b>?" "$keyboard"
+}
+
+confirm_deploy_device() {
+    local dname="$1"
+    tg_send_message "$TELEGRAM_CHAT_ID" "🔑 Запускаю деплой на <b>$dname</b>…"
+    dep_spawn "$dname"
+}
+
+cancel_deploy_device() {
+    local dname="$1"
+    tg_send_message "$TELEGRAM_CHAT_ID" "❌ Деплой на <b>$dname</b> отменён."
+}
+
+# =============================================================================
 # UPDATE PROCESSING
 # =============================================================================
 
@@ -771,6 +865,43 @@ process_update() {
                 tg_clear_keyboard "$chat_id" "$cb_msg_id"
                 cancel_update_all ;;
 
+            # --- Деплой ключей/прав ---
+            deploy_menu)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                show_deploy_menu ;;
+            deploy_all)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                ask_deploy_all ;;
+            deploy_all_confirm)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                confirm_deploy_all ;;
+            deploy_all_cancel)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                cancel_deploy_all ;;
+            deploy_status)
+                dep_print_last_status ;;
+            # ВАЖНО: confirm/cancel должны идти РАНЬШЕ общего deploy_dev_*,
+            # иначе case "съест" их как выбор устройства с именем
+            # "confirm_<dev>"/"cancel_<dev>".
+            deploy_dev_confirm_*)
+                local dname=${callback_data#deploy_dev_confirm_}
+                if [[ "$dname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    confirm_deploy_device "$dname"
+                fi ;;
+            deploy_dev_cancel_*)
+                local dname=${callback_data#deploy_dev_cancel_}
+                if [[ "$dname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    cancel_deploy_device "$dname"
+                fi ;;
+            deploy_dev_*)
+                local dname=${callback_data#deploy_dev_}
+                if [[ "$dname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    ask_deploy_device "$dname"
+                fi ;;
+
             download_list_*)
                 local dname=${callback_data#download_list_}
                 list_backups_for_download "$dname" ;;
@@ -806,6 +937,10 @@ process_update() {
             /start|/menu)   clear_user_state "$chat_id"; show_menu ;;
             /updates)       show_updates_menu ;;
             /checkupdates)  show_updates_menu ;;
+            /deploy)        show_deploy_menu ;;
+
+            # /deploy имя_устройства — мгновенный запуск деплоя на одном роутере
+            /deploy\ *)     ask_deploy_device "${message_text#/deploy }" ;;
             /cancel)        cancel_device_addition "$chat_id" ;;
             /status)        get_backup_status ;;
             /backup)        show_backup_menu ;;
