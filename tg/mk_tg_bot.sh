@@ -494,11 +494,13 @@ rup_spawn() {
 
 show_updates_menu() {
     local keyboard='[
+        [{"text": "⬆️ Обновить ВСЕ по очереди (AP→SW→GW)", "callback_data": "upd_all"}],
         [{"text": "🔎 Проверить сейчас (все)", "callback_data": "upd_check_all"}],
         [{"text": "📋 Последний статус", "callback_data": "upd_status"}],
+        [{"text": "🔩 RouterBOOT firmware", "callback_data": "upd_rb_menu"}],
         [{"text": "🔙 Back", "callback_data": "menu"}]
     ]'
-    tg_send_keyboard "$TELEGRAM_CHAT_ID" "⬆️ <b>Обновления RouterOS</b>\n\n• Проверка идёт через сам роутер (<code>/system package update</code>)\n• Перед установкой создаётся резервная копия (MikroGit)\n• Установка — только после вашего подтверждения и требует перезагрузки устройства\n• Обновление — в рамках текущей ветки (6.x или 7.x)\n\nВыберите действие:" "$keyboard"
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "⬆️ <b>Обновления RouterOS</b>\n\n• Проверка идёт через сам роутер (<code>/system package update</code>)\n• Перед установкой создаётся резервная копия (MikroGit)\n• Установка — только после вашего подтверждения и требует перезагрузки устройства\n• Обновление — в рамках текущей ветки (6.x или 7.x)\n• RouterBOOT firmware обновляется автоматически сразу после обновления RouterOS\n  (отдельно — кнопкой «RouterBOOT firmware»)\n\nВыберите действие:" "$keyboard"
 }
 
 start_update_check() {
@@ -567,6 +569,73 @@ cancel_install_update() {
     local dname="$1"
     log "Update install cancelled: $dname"
     tg_send_message "$TELEGRAM_CHAT_ID" "❌ Установка на <b>$dname</b> отменена."
+}
+
+# --- RouterBOOT firmware: меню выбора устройства и подтверждение ---
+show_rb_menu() {
+    local keyboard='['
+    local count=0 name ip port user description
+    while IFS=':' read -r name ip port user description; do
+        [[ $name =~ ^# ]] || [[ -z $name ]] && continue
+        keyboard+='[{"text":"🔩 '$name'","callback_data":"upd_rb_pick_'$name'"}],'
+        ((count++))
+    done < "${CONFIG_FILE:-/home/aionis/MikroGit/devices.conf}"
+    [ $count -eq 0 ] && { tg_send_message "$TELEGRAM_CHAT_ID" "❌ Нет устройств в devices.conf."; return 1; }
+    keyboard+='[{"text":"🔙 Back","callback_data":"upd_menu"}]'
+    keyboard+=']'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🔩 <b>RouterBOOT firmware</b>\n\nОбновление загрузчика (<code>/system routerboard upgrade</code>) с последующей перезагрузкой.\nВыберите устройство (или вернитесь в меню обновлений):" "$keyboard"
+}
+
+ask_rb_upgrade() {
+    local dname="$1"
+    log "RouterBOOT upgrade requested: $dname"
+    local keyboard='[
+        [{"text": "✅ Обновить RouterBOOT", "callback_data": "upd_rb_confirm_'\"$dname\"'"}],
+        [{"text": "❌ Отмена", "callback_data": "upd_rb_cancel_'\"$dname\"'"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "⚠️ <b>Подтвердите обновление RouterBOOT firmware</b> на <b>$dname</b>\n\n• Выполнится <code>/system routerboard upgrade</code>\n• Роутер <b>перезагрузится</b> и будет недоступен несколько минут\n• <b>НЕ выключайте питание</b> во время прошивки!\n\nПродолжить?" "$keyboard"
+}
+
+confirm_rb_upgrade() {
+    local dname="$1"
+    if [ -d "$(rup_state_dir)/lock_apply_$dname" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ На устройстве <b>$dname</b> уже выполняется операция (установка/обновление RouterBOOT). Дождитесь завершения."
+        return 1
+    fi
+    log "Confirm RouterBOOT upgrade: $dname"
+    tg_send_message "$TELEGRAM_CHAT_ID" "🔩 <b>$dname</b>: запускаю обновление RouterBOOT firmware…\nХод выполнения буду присылать сюда."
+    rup_spawn routerboard "$dname"
+}
+
+cancel_rb_upgrade() {
+    local dname="$1"
+    log "RouterBOOT upgrade cancelled: $dname"
+    tg_send_message "$TELEGRAM_CHAT_ID" "❌ Обновление RouterBOOT на <b>$dname</b> отменено."
+}
+
+# --- Обновить все по очереди (AP -> SW -> GW -> остальные) ---
+ask_update_all() {
+    log "Update ALL requested"
+    local keyboard='[
+        [{"text": "✅ Да, обновить все по очереди", "callback_data": "upd_all_confirm"}],
+        [{"text": "❌ Отмена", "callback_data": "upd_all_cancel"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "⚠️ <b>Обновить ВСЕ устройства по очереди?</b>\n\n• Порядок: <b>AP → SW → GW</b> → остальные (по имени из devices.conf)\n• Каждое устройство обновляется и <b>проверяется</b> перед переходом к следующему\n• После RouterOS — автоматически проверяется и обновляется RouterBOOT firmware\n• Роутеры будут <b>перезагружаться</b> по одному; весь процесс может занять <b>долгое время</b>\n\nПродолжить?" "$keyboard"
+}
+
+confirm_update_all() {
+    log "Confirm update ALL"
+    if [ -d "$(rup_state_dir)/lock_update_all" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Обновление всех уже запущено. Дождитесь завершения."
+        return 1
+    fi
+    tg_send_message "$TELEGRAM_CHAT_ID" "🔄 <b>Запускаю поочерёдное обновление всех устройств…</b>\nХод выполнения буду присылать сюда."
+    rup_spawn updateall
+}
+
+cancel_update_all() {
+    log "Update ALL cancelled"
+    tg_send_message "$TELEGRAM_CHAT_ID" "❌ Обновление всех отменено."
 }
 
 # =============================================================================
@@ -670,6 +739,37 @@ process_update() {
                     tg_clear_keyboard "$chat_id" "$cb_msg_id"
                     cancel_install_update "$dname"
                 fi ;;
+            # --- RouterBOOT firmware ---
+            upd_rb_menu)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                show_rb_menu ;;
+            upd_rb_pick_*)
+                local rbname=${callback_data#upd_rb_pick_}
+                if [[ "$rbname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    ask_rb_upgrade "$rbname"
+                fi ;;
+            upd_rb_confirm_*)
+                local rbname=${callback_data#upd_rb_confirm_}
+                if [[ "$rbname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    confirm_rb_upgrade "$rbname"
+                fi ;;
+            upd_rb_cancel_*)
+                local rbname=${callback_data#upd_rb_cancel_}
+                if [[ "$rbname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    cancel_rb_upgrade "$rbname"
+                fi ;;
+            upd_all)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                ask_update_all ;;
+            upd_all_confirm)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                confirm_update_all ;;
+            upd_all_cancel)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                cancel_update_all ;;
 
             download_list_*)
                 local dname=${callback_data#download_list_}
