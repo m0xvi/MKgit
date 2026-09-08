@@ -42,6 +42,13 @@ else
     echo "ERROR: mk_deploy.sh not found" >&2
 fi
 
+# --- Load hardening worker (сервисы/ssh роутеров; CLI: mk_harden.sh) ---
+if [ -f "$SCRIPT_DIR/mk_harden.sh" ]; then
+    source "$SCRIPT_DIR/mk_harden.sh"
+else
+    echo "ERROR: mk_harden.sh not found" >&2
+fi
+
 # --- Colors ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -165,6 +172,88 @@ perform_backup() {
             tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Backup failed!</b>\nDevice: $device_name\nCheck logs."
             error "Backup failed: $device_name"
         fi
+    fi
+}
+
+# =============================================================================
+# Полный бэкап «все устройства» — фоновый воркер с кнопкой «⏹ Остановить»
+# (бот не блокируется, как раньше; одиночные бэкапы остаются синхронными).
+# =============================================================================
+backup_state_dir()  { echo "$(dirname "${LOG_FILE:-/tmp/mk_backup.log}")/backup_state"; }
+bup_pid_file()      { echo "$(backup_state_dir)/worker.pid"; }
+bup_lock_dir()      { echo "$(backup_state_dir)/lock_backup"; }
+
+# Идёт ли полный бэкап (по pid воркера)
+bup_running() {
+    local p
+    p=$(cat "$(bup_pid_file)" 2>/dev/null) || return 1
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+bup_stop_now() {
+    local p
+    p=$(cat "$(bup_pid_file)" 2>/dev/null) || return 1
+    # TERM всей группе процессов (воркер + MikroGit.sh + ssh), затем одиночный
+    kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
+}
+
+bup_cleanup_now() {
+    rm -f "$(bup_pid_file)" 2>/dev/null || true
+    rm -rf "$(bup_lock_dir)" 2>/dev/null || true
+}
+
+# Тело фонового воркера: поднимает тот же конфиг/хелперы, что и бот.
+bup_worker_body() {
+    local d
+    d="$(backup_state_dir)"
+    cat <<WEOF
+#!/bin/bash
+set -uo pipefail
+source "$SCRIPT_DIR/tg_bot_config.sh"
+if ! declare -f tg_send_message > /dev/null 2>&1; then
+    source "$SCRIPT_DIR/tg_api_helpers.sh"
+fi
+pid_file="$d/worker.pid"
+lock_dir="$d/lock_backup"
+trap 'rm -f "\$pid_file"; rm -rf "\$lock_dir"; exit 130' TERM INT
+"\$BACKUP_SCRIPT" --telegram "manual"
+rc=\$?
+rm -f "\$pid_file"
+rm -rf "\$lock_dir"
+exit \$rc
+WEOF
+}
+
+perform_backup_all_bg() {
+    if bup_running; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Полное резервное копирование уже идёт. Дождитесь завершения."
+        return 1
+    fi
+    mkdir -p "$(backup_state_dir)" 2>/dev/null || true
+    if ! mkdir "$(bup_lock_dir)" 2>/dev/null; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Полное резервное копирование уже запускается. Попробуйте через пару секунд."
+        return 1
+    fi
+    log "Backup ALL worker spawned"
+    local kb='[[{"text":"⏹ Остановить бэкап","callback_data":"backup_stop"}]]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🔄 <b>Запускаю полное резервное копирование…</b>\nХод будет виден здесь.\n\n⏹ Кнопка «Остановить бэкап» прерывает текущую операцию." "$kb"
+    # в отдельной сессии, чтобы stop мог погасить всю группу (воркер+скрипт+ssh)
+    if command -v setsid > /dev/null 2>&1; then
+        setsid bash -c "$(bup_worker_body)" >> "$LOG_FILE" 2>&1 &
+    else
+        bash -c "$(bup_worker_body)" >> "$LOG_FILE" 2>&1 &
+    fi
+    echo "$!" > "$(bup_pid_file)" 2>/dev/null || true
+}
+
+# Остановка полного бэкапа (кнопка backup_stop)
+backup_stop_now() {
+    if bup_running; then
+        bup_stop_now
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏹ Останавливаю полное резервное копирование…"
+    else
+        bup_cleanup_now
+        tg_send_message "$TELEGRAM_CHAT_ID" "ℹ️ Активного полного бэкапа нет — останавливать нечего."
     fi
 }
 
@@ -445,14 +534,145 @@ send_latest_backups() {
 # MENUS
 # =============================================================================
 
+# =============================================================================
+# LOGS: просмотр логов через Telegram c вычисткой секретов
+# =============================================================================
+
+# Список значений, которые никогда не должны попадать в Telegram-лог.
+log_secret_values() {
+    local v s
+    for v in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID \
+             DEPLOY_TL_PASS TL_PASS \
+             DEPLOY_NEWUSER_PASS NEWUSER_PASS; do
+        s="${!v:-}"
+        # Короткие значения не подставляем посимвольно — поймаем их паттернами
+        # (password=..., expect и т.п.). От 4 символов — глушим намертво.
+        if [ -n "$s" ] && [ "${#s}" -ge 4 ]; then
+            printf '%s\n' "$s"
+        fi
+    done | sort -ru
+}
+
+# Очистка строки лога от секретов. Читает stdin построчно, пишет в stdout.
+log_sanitize() {
+    local line pats="" svals="" s
+    # 1) известные секретные значения (токен, пароли, пути к закрытым ключам)
+    svals="$(log_secret_values)"
+    # 2) типовые паттерны паролей внутри выводимых команд/expect.
+    #    Пропускаем также весь многострочный блок приватного ключа.
+    local inkey=0
+    while IFS= read -r line; do
+        if [ "$inkey" = "1" ]; then
+            # внутри блока ключа — не печатаем ничего, ждём конец
+            if printf '%s' "$line" | grep -qE -- '-----END [A-Z ]*PRIVATE KEY-----'; then
+                inkey=0
+                echo "[SCRUBBED: блок приватного ключа]"
+            fi
+            continue
+        fi
+        if printf '%s' "$line" | grep -qE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----|OPENSSH PRIVATE KEY|-----BEGIN RSA PRIVATE KEY-----|-----BEGIN EC PRIVATE KEY-----'; then
+            inkey=1
+            continue
+        fi
+        # Сначала — значения из конфига (длинные, уникальные)
+        if [ -n "$svals" ]; then
+            while IFS= read -r s; do
+                [ -n "$s" ] && line="${line//"$s"/[SCRUBBED]}"
+            done <<< "$svals"
+        fi
+        # Сгенерированные пароли вида mk-<epoch>-<random>
+        line="$(printf '%s' "$line" | sed -E 's/(password[[:space:]]*=[[:space:]]*)mk-[0-9]+-[0-9]+/\1[SCRUBBED]/Ig')"
+        line="$(printf '%s' "$line" | sed -E 's/(password[[:space:]]*=[[:space:]]*\")[^\"]*(\")/\1[SCRUBBED]\2/Ig')"
+        line="$(printf '%s' "$line" | sed -E 's/(password[[:space:]]*=[[:space:]]*)[^ \"][^ ]*/\1[SCRUBBED]/Ig')"
+        line="$(printf '%s' "$line" | sed -E 's/(passphrase[[:space:]]*[:=][[:space:]]*)[^ ]+/\1[SCRUBBED]/Ig')"
+        printf '%s\n' "$line"
+    done
+}
+
+# Список доступных логов: путь<TAB>подпись<TAB>число строк хвоста
+log_candidates() {
+    local f d
+    f="${LOG_FILE:-}"
+    [ -n "$f" ] && [ -f "$f" ] && printf '%s\tОсновной лог (все операции)\t70\n' "$f"
+    if declare -f dep_state_dir > /dev/null 2>&1; then
+        d="$(dep_state_dir)/last_run.log"
+        [ -f "$d" ] && printf '%s\tДеплой: последний прогон\t60\n' "$d"
+    fi
+    if declare -f harden_state_dir > /dev/null 2>&1; then
+        d="$(harden_state_dir)/last_run.log"
+        [ -f "$d" ] && printf '%s\tХардненинг: последний прогон\t60\n' "$d"
+    fi
+}
+
+send_log_tail() {
+    # $1 = путь, $2 = подпись, $3 = число строк
+    local path="$1" label="$2" nlines="${3:-60}"
+    if [ ! -f "$path" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ Файл лога не найден: <code>$path</code>"
+        return 1
+    fi
+    local buf chunk="" line out
+    buf="$(tail -n "$nlines" "$path" 2>/dev/null | log_sanitize)"
+    if [ -z "$(printf '%s' "$buf" | tr -d '[:space:]')" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "📜 <b>$label</b>\n\n(лог пуст или содержит только служебные строки)"
+        return 0
+    fi
+    local header="📜 <b>$label</b>\n<code>$path</code>\n\n"
+    while IFS= read -r line; do
+        # экранирование HTML (логи могут содержать <, >, &)
+        line="$(printf '%s' "$line" | sed -e 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
+        if [ $(( ${#chunk} + ${#line} + 1 )) -gt 3800 ]; then
+            tg_send_message "$TELEGRAM_CHAT_ID" "${header}${chunk}"
+            chunk=""
+        fi
+        chunk+="${line}"$'\n'
+    done <<< "$buf"
+    if [ -n "$chunk" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "${header}${chunk}"
+    fi
+    return 0
+}
+
+show_logs_menu() {
+    local entries
+    entries="$(log_candidates)"
+    if [ -z "$entries" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "📜 <b>Логи</b>\n\nФайлы логов пока не найдены.\nБазовый: <code>${LOG_FILE:-не задан}</code>\n\nВыполните любую операцию — логи появятся в этом меню."
+        return 0
+    fi
+    local keyboard='[' n=0 path label lines
+    while IFS=$'\t' read -r path label lines; do
+        keyboard+="[{\"text\": \"📄 $label\", \"callback_data\": \"logs_tail_$n\"}],"
+        n=$((n+1))
+    done <<< "$entries"
+    keyboard+='[{"text":"🔙 Back","callback_data":"menu"}]'
+    keyboard+=']'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "📜 <b>Логи</b>\n\nПоказываю последние строки с автоматической очисткой секретов (пароли, ключи, токены → <code>[SCRUBBED]</code>):" "$keyboard"
+}
+
+show_log_tail_by_index() {
+    # $1 = порядковый номер в списке log_candidates
+    local idx="$1" n=0 path label lines
+    while IFS=$'\t' read -r path label lines; do
+        if [ "$n" = "$idx" ]; then
+            send_log_tail "$path" "$label" "$lines"
+            return 0
+        fi
+        n=$((n+1))
+    done <<< "$(log_candidates)"
+    tg_send_message "$TELEGRAM_CHAT_ID" "❌ Лог #$idx не найден (список изменился). Откройте меню «Логи» заново."
+    return 1
+}
+
+
 show_menu() {
     local keyboard='[
         [{"text": "📊 Status", "callback_data": "status"}, {"text": "📥 Download", "callback_data": "download_menu"}],
         [{"text": "🔄 Backup All", "callback_data": "backup_all"}, {"text": "🔧 Backup Device", "callback_data": "backup_menu"}],
         [{"text": "📋 List Devices", "callback_data": "list_devices"}, {"text": "🔑 SSH Keys", "callback_data": "ssh_keys_menu"}],
         [{"text": "⬆️ Обновления RouterOS", "callback_data": "upd_menu"}],
-        [{"text": "🔑 Деплой ключей/прав", "callback_data": "deploy_menu"}],
-        [{"text": "➕ Add Device", "callback_data": "add_device"}]
+        [{"text": "🔑 Деплой ключей/прав", "callback_data": "deploy_menu"}, {"text": "🛡 Сервисы/SSH", "callback_data": "hdn_menu"}],
+        [{"text": "📜 Логи", "callback_data": "logs_menu"}, {"text": "➕ Add Device", "callback_data": "add_device"}]
     ]'
     tg_send_keyboard "$TELEGRAM_CHAT_ID" "🤖 <b>MikroTik Backup Bot</b>\nChoose an action:" "$keyboard"
 }
@@ -498,6 +718,16 @@ show_download_menu() {
 rup_spawn() {
     nohup bash "$SCRIPT_DIR/mk_updates.sh" "$@" >> "$LOG_FILE" 2>&1 &
     log "Update worker spawned: mk_updates.sh $*"
+}
+
+# Идёт ли какая-либо операция обновлений (для кнопки «Остановить»)
+rup_any_busy() {
+    local d="$(rup_state_dir)" lock
+    for lock in lock_check lock_update_all; do
+        [ -d "$d/$lock" ] && return 0
+    done
+    ls "$d"/lock_apply_* "$d"/lock_rb_* > /dev/null 2>&1 && return 0
+    return 1
 }
 
 show_updates_menu() {
@@ -555,8 +785,8 @@ ask_install_update() {
         detail="\n📦 $inst → <b>${latest:-?}</b>"
     fi
     local keyboard='[
-        [{"text": "✅ Подтвердить и обновить", "callback_data": "upd_confirm_'"$dname"'"}],
-        [{"text": "❌ Отмена", "callback_data": "upd_cancel_'"$dname"'"}]
+        [{"text": "✅ Подтвердить и обновить", "callback_data": "upd_confirm_'$dname'"}],
+        [{"text": "❌ Отмена", "callback_data": "upd_cancel_'$dname'"}]
     ]'
     tg_send_keyboard "$TELEGRAM_CHAT_ID" "⚠️ <b>Подтвердите установку RouterOS</b> на <b>$dname</b>$detail\n\n• Сначала будет сделана резервная копия конфигурации\n• Роутер <b>перезагрузится</b> (~2–5 минут недоступности)\n• Обновление — в рамках текущей ветки\n\nПродолжить?" "$keyboard"
 }
@@ -598,8 +828,8 @@ ask_rb_upgrade() {
     local dname="$1"
     log "RouterBOOT upgrade requested: $dname"
     local keyboard='[
-        [{"text": "✅ Обновить RouterBOOT", "callback_data": "upd_rb_confirm_'\"$dname\"'"}],
-        [{"text": "❌ Отмена", "callback_data": "upd_rb_cancel_'\"$dname\"'"}]
+        [{"text": "✅ Обновить RouterBOOT", "callback_data": "upd_rb_confirm_'$dname'"}],
+        [{"text": "❌ Отмена", "callback_data": "upd_rb_cancel_'$dname'"}]
     ]'
     tg_send_keyboard "$TELEGRAM_CHAT_ID" "⚠️ <b>Подтвердите обновление RouterBOOT firmware</b> на <b>$dname</b>\n\n• Выполнится <code>/system routerboard upgrade</code>\n• Роутер <b>перезагрузится</b> и будет недоступен несколько минут\n• <b>НЕ выключайте питание</b> во время прошивки!\n\nПродолжить?" "$keyboard"
 }
@@ -674,7 +904,7 @@ show_deploy_menu() {
     [ $count -eq 0 ] && { tg_send_message "$TELEGRAM_CHAT_ID" "No devices configured!"; return 1; }
     keyboard+='[{"text": "🔙 Back", "callback_data": "menu"}]'
     keyboard+=']'
-    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🔑 <b>Деплой ключа MikroGit и прав пользователя</b>\n\n• ставит/обновляет SSH-ключ целевому пользователю (у кого нет);\n• проверяет права НЕ даёт группу full: права доводятся до минимально необходимых — группа <code>mikrogit</code> (создаётся на роутере сама), политики <code>ssh,read,write,test,reboot,policy</code>; хватает для обновлений и бэкапа;\n• вход на роутер — <code>auto</code>: telnet, а если telnet отключён — ssh;\n• работает по одному устройству за раз, по каждому — отчёт.\n\nВыберите действие:" "$keyboard"
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🔑 <b>Деплой ключа MikroGit и прав пользователя</b>\n\n• ставит/обновляет SSH-ключ целевому пользователю (у кого нет);\n• проверяет права НЕ даёт группу full: права доводятся до минимально необходимых — группа <code>mikrogit</code> (создаётся на роутере сама), политики <code>ssh,read,write,test,reboot,policy,ftp</code> (ftp — чтобы хардненинг мог залить скрипт по scp); хватает для бэкапов, обновлений и хардненинга;\n• вход на роутер — только по SSH (telnet удалён);\n• работает по одному устройству за раз, по каждому — отчёт.\n\nВыберите действие:" "$keyboard"
 }
 
 ask_deploy_all() {
@@ -730,6 +960,95 @@ confirm_deploy_device() {
 cancel_deploy_device() {
     local dname="$1"
     tg_send_message "$TELEGRAM_CHAT_ID" "❌ Деплой на <b>$dname</b> отменён."
+}
+
+# =============================================================================
+# HARDEN: сервисы/SSH роутеров (см. mk_harden.sh + harden_services.rsc)
+# =============================================================================
+
+# Запуск фонового worker'а хардненинга (не блокирует цикл опроса).
+# Вывод воркера пишется в ОТДЕЛЬНЫЙ run-лог на каждый запуск (как у деплоя):
+#   <harden_state_dir>/run_<device>.log  (+ копия last_run.log при завершении)
+# а pid и путь лога — в журнал бота, чтобы в любой момент было видно, где
+# смотреть следы воркера (в systemd journal сам воркер не пишет).
+harden_spawn() {
+    local hscope="${1:-all}" hstate hlog pid
+    hstate="$(harden_state_dir)"
+    mkdir -p "$hstate" 2>/dev/null || true
+    hlog="$hstate/run_${hscope}.log"
+    : > "$hlog" 2>/dev/null || true
+    nohup bash "$SCRIPT_DIR/mk_harden.sh" "$@" >> "$hlog" 2>&1 &
+    pid=$!
+    log "Harden worker spawned: mk_harden.sh $* (pid=$pid, лог: $hlog)"
+}
+
+# Занят ли сейчас хардненинг?
+harden_busy_now() {
+    [ -d "$(harden_state_dir)/lock_harden" ]
+}
+
+show_harden_menu() {
+    local keyboard='['
+    keyboard+='[{"text": "⚡ На ВСЕХ (по очереди)", "callback_data": "hdn_all"}],'
+    local count=0 name
+    while IFS=':' read -r name ip port user description; do
+        [[ $name =~ ^# ]] || [[ -z $name ]] && continue
+        keyboard+='[{"text": "🛡 '$name'", "callback_data": "hdn_dev_'$name'"}],'
+        ((count++))
+    done < "$CONFIG_FILE"
+    [ $count -eq 0 ] && { tg_send_message "$TELEGRAM_CHAT_ID" "No devices configured!"; return 1; }
+    keyboard+='[{"text": "🔙 Back", "callback_data": "menu"}]'
+    keyboard+=']'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🛡 <b>Сервисы и SSH роутеров (хардненинг)</b>\n\n• на выбранном роутере выключит ВСЕ <code>/ip service</code>, кроме <code>ssh</code> и <code>winbox</code>;\n• переведёт ssh на <b>случайный порт</b> (20000–60000);\n• ограничит ssh адресами (<code>available from</code>): 10.20.9.11, 192.168.10.89;\n• <b>devices.conf обновится автоматически</b> (новый ssh-порт), winbox не трогается.\n\n⚠️ После прогона вход на роутер — только по ssh на новом порту и только с разрешённых адресов. Нужен выполненный деплой ключа.\n\nВыберите действие:" "$keyboard"
+}
+
+ask_harden_all() {
+    if harden_busy_now; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Хардненинг уже запущен. Дождитесь завершения."
+        return
+    fi
+    local keyboard='[
+        [{"text": "✅ Да, на всех", "callback_data": "hdn_all_confirm"}],
+        [{"text": "❌ Отмена", "callback_data": "hdn_all_cancel"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🛡 <b>Хардненинг на ВСЕХ устройствах?</b>\nСмена ssh-порта на каждом + доступ только с разрешённых адресов. Процесс в фоне, по каждому устройству придёт отчёт." "$keyboard"
+}
+
+confirm_harden_all() {
+    tg_send_message "$TELEGRAM_CHAT_ID" "🛡 Запускаю хардненинг на все устройства (по очереди)…"
+    harden_spawn all
+}
+
+cancel_harden_all() {
+    tg_send_message "$TELEGRAM_CHAT_ID" "❌ Отменено."
+}
+
+ask_harden_device() {
+    local dname="$1"
+    if harden_busy_now; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Хардненинг уже запущен. Дождитесь завершения."
+        return
+    fi
+    if [ -z "$dname" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ Не указано устройство."
+        return
+    fi
+    local keyboard='[
+        [{"text": "✅ Выполнить", "callback_data": "hdn_dev_confirm_'$dname'"}],
+        [{"text": "❌ Отмена", "callback_data": "hdn_dev_cancel_'$dname'"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🛡 Хардненинг на <b>$dname</b>?\nБудут выключены лишние сервисы, ssh уйдёт на случайный порт и ограничится адресами. Текущее ssh-соединение не оборвётся." "$keyboard"
+}
+
+confirm_harden_device() {
+    local dname="$1"
+    tg_send_message "$TELEGRAM_CHAT_ID" "🛡 Запускаю хардненинг на <b>$dname</b>…"
+    harden_spawn "$dname"
+}
+
+cancel_harden_device() {
+    local dname="$1"
+    tg_send_message "$TELEGRAM_CHAT_ID" "❌ Хардненинг на <b>$dname</b> отменён."
 }
 
 # =============================================================================
@@ -802,10 +1121,22 @@ process_update() {
         [ -n "$cb_id" ] && tg_answer_callback "$cb_id"
 
         case "$callback_data" in
+            # --- Логи (с очисткой секретов) ---
+            logs_menu)          show_logs_menu ;;
+            logs_tail_*)
+                local lg_idx=${callback_data#logs_tail_}
+                if [[ "$lg_idx" =~ ^[0-9]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    show_log_tail_by_index "$lg_idx"
+                fi ;;
             menu)               clear_user_state "$chat_id"; show_menu ;;
             status)             get_backup_status ;;
             list_devices)       list_devices ;;
-            backup_all)         perform_backup "all" ;;
+            backup_all)         perform_backup_all_bg ;;
+            backup_stop)
+                # Кнопка «⏹ Остановить бэкап»
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                backup_stop_now ;;
             add_device)         start_device_addition "$chat_id" ;;
             ssh_keys_menu)      show_ssh_keys_menu ;;
             download_menu)      show_download_menu ;;
@@ -864,6 +1195,15 @@ process_update() {
             upd_all_cancel)
                 tg_clear_keyboard "$chat_id" "$cb_msg_id"
                 cancel_update_all ;;
+            upd_stop)
+                # Кнопка «⏹ Остановить» на сообщениях воркера обновлений
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                if rup_any_busy; then
+                    rup_stop_set
+                    tg_send_message "$chat_id" "⏹ Останавливаю операции обновлений: завершу текущее устройство и остановлюсь."
+                else
+                    tg_send_message "$chat_id" "ℹ️ Активных операций обновлений нет — останавливать нечего."
+                fi ;;
 
             # --- Деплой ключей/прав ---
             deploy_menu)
@@ -880,6 +1220,15 @@ process_update() {
                 cancel_deploy_all ;;
             deploy_status)
                 dep_print_last_status ;;
+            deploy_stop)
+                # Кнопка «⏹ Остановить деплой» на сообщениях воркера
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                if dep_busy_now; then
+                    dep_cancel_set
+                    tg_send_message "$chat_id" "⏹ Останавливаю деплой: завершу текущее устройство и остановлюсь."
+                else
+                    tg_send_message "$chat_id" "ℹ️ Активного деплоя нет — останавливать нечего."
+                fi ;;
             # ВАЖНО: confirm/cancel должны идти РАНЬШЕ общего deploy_dev_*,
             # иначе case "съест" их как выбор устройства с именем
             # "confirm_<dev>"/"cancel_<dev>".
@@ -900,6 +1249,47 @@ process_update() {
                 if [[ "$dname" =~ ^[A-Za-z0-9_-]+$ ]]; then
                     tg_clear_keyboard "$chat_id" "$cb_msg_id"
                     ask_deploy_device "$dname"
+                fi ;;
+
+            # --- Хардненинг сервисов/ssh ---
+            hdn_menu)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                show_harden_menu ;;
+            hdn_all)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                ask_harden_all ;;
+            hdn_all_confirm)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                confirm_harden_all ;;
+            hdn_all_cancel)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                cancel_harden_all ;;
+            hdn_stop)
+                # Кнопка «⏹ Остановить хардненинг» на сообщениях воркера
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                if harden_busy_now; then
+                    harden_cancel_set
+                    tg_send_message "$chat_id" "⏹ Останавливаю хардненинг: завершу текущий роутер и остановлюсь."
+                else
+                    tg_send_message "$chat_id" "ℹ️ Активного хардненинга нет — останавливать нечего."
+                fi ;;
+            hdn_dev_confirm_*)
+                local hname=${callback_data#hdn_dev_confirm_}
+                if [[ "$hname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    confirm_harden_device "$hname"
+                fi ;;
+            hdn_dev_cancel_*)
+                local hname=${callback_data#hdn_dev_cancel_}
+                if [[ "$hname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    cancel_harden_device "$hname"
+                fi ;;
+            hdn_dev_*)
+                local hname=${callback_data#hdn_dev_}
+                if [[ "$hname" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                    ask_harden_device "$hname"
                 fi ;;
 
             download_list_*)
@@ -941,6 +1331,10 @@ process_update() {
 
             # /deploy имя_устройства — мгновенный запуск деплоя на одном роутере
             /deploy\ *)     ask_deploy_device "${message_text#/deploy }" ;;
+            /harden)        show_harden_menu ;;
+
+            # /harden имя_устройства — хардненинг одного роутера
+            /harden\ *)     ask_harden_device "${message_text#/harden }" ;;
             /cancel)        cancel_device_addition "$chat_id" ;;
             /status)        get_backup_status ;;
             /backup)        show_backup_menu ;;

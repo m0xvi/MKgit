@@ -74,8 +74,10 @@ rup_state_dir() {
     echo "${UPDATE_STATE_DIR:-$(dirname "${LOG_FILE:-/tmp/mk_updates.log}")/update_state}"
 }
 
-# Автопроверка по расписанию (использует бот в run_bot)
-UPDATE_AUTO_CHECK="${UPDATE_AUTO_CHECK:-1}"
+# Автопроверка по расписанию (использует бот в run_bot).
+# 0 = выкл (по умолчанию): подключения к роутерам только по кнопке/команде.
+# 1 = вкл: бот сам запускает «check all» не чаще раза в UPDATE_AUTO_INTERVAL_HOURS.
+UPDATE_AUTO_CHECK="${UPDATE_AUTO_CHECK:-0}"
 UPDATE_AUTO_INTERVAL_HOURS="${UPDATE_AUTO_INTERVAL_HOURS:-24}"
 
 # SSH опции (по образцу остальных скриптов репозитория)

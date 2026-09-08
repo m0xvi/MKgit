@@ -1,30 +1,33 @@
 #!/bin/bash
 # =============================================================================
-# Развёртывание SSH-ключа MikroGit на MikroTik-роутерах: вход администратора по
-# TELNET или по SSH (LOGIN_VIA=auto/telnet/ssh). SSH нужен для роутеров, где
-# telnet отключён.
+# Развёртывание SSH-ключа MikroGit на MikroTik-роутерах. Вход на роутер — ТОЛЬКО
+# по SSH (telnet полностью удалён из всех методов входа). Порт SSH для каждого
+# устройства берётся из devices.conf (поле 3).
 # -----------------------------------------------------------------------------
-# Хосты берутся из devices.conf (IP и порт оттуда верны), но подключение по
-# telnet выполняется ОТДЕЛЬНЫМ административным пользователем (TL_USER),
+# Хосты берутся из devices.conf (IP и порт оттуда верны); вход администратора
+# выполняется по SSH отдельным пользователем (TL_USER, пароль TL_PASS),
 # а НЕ тем, что указан в devices.conf. Ключ назначается целевому пользователю
 # (TARGET_USER): если он уже существует на роутере — только импорт ключа;
 # если не существует — создаётся в группе TARGET_GROUP с паролем из
 # NEWUSER_PASS (или случайным) и импортируется ключ.
 #
 # ПРАВА: вместо встроенной группы full (все политики) деплой приводит целевого
-# пользователя к отдельной группе TARGET_GROUP (по умолчанию «automation») с
+# пользователя к отдельной группе TARGET_GROUP (по умолчанию «mikrogit») с
 # МИНИМАЛЬНЫМ набором политик TARGET_POLICY (по умолчанию
-# ssh,read,write,test,reboot,policy). Если группа отсутствует на роутере — она
-# создаётся с этими политиками; существующая группа не переопределяется
-# (только если пользователь в неё ещё не переведён). TARGET_GROUP="" = права
+# ssh,read,write,test,reboot,policy,ftp). ftp даёт file-доступ по scp/sftp —
+# без него хардненинг (mk_harden.sh) не сможет залить скрипт на роутер.
+# Если группа отсутствует на роутере — она создаётся с этими политиками;
+# существующая группа не переопределяется «вслепую»: добавляются только
+# недостающие требуемые политики (при невозможности прочитать политики группы
+# целевой группе устанавливается требуемый набор). TARGET_GROUP="" = права
 # не менять (только проверка/показ).
 #
 # Параметры: 1) переменные окружения, 2) файл deploy.conf рядом со скриптом
 # (приоритет у окружения: строки deploy.conf применяются, только если
 # соответствующая переменная окружения пуста).
 #
-# Зависимости: expect + telnet (для LOGIN_VIA=telnet) и/или ssh
-# (sudo apt-get install -y expect telnet openssh-client)
+# Зависимости: expect + openssh-client
+# (sudo apt-get install -y expect openssh-client)
 # =============================================================================
 set -uo pipefail
 
@@ -60,28 +63,24 @@ _load_conf
 DEVICES_CONF="${DEVICES_CONF:-/home/aionis/MikroGit/devices.conf}"
 KEY_FILE="${KEY_FILE:-/home/aionis/.ssh/mk_key.pub}"
 KEY_PRIV="${KEY_PRIV:-${KEY_FILE%.pub}}"  # приватный ключ для ПРОВЕРКИ входа
-TL_USER="${TL_USER:-admin}"          # логин для входа по telnet
-TL_PORT="${TL_PORT:-23}"             # порт telnet (стандартный)
-TL_PASS="${TL_PASS:-}"               # пароль для входа по telnet (обязателен)
+TL_USER="${TL_USER:-admin}"          # администраторский логин (вход по SSH)
+TL_PASS="${TL_PASS:-}"               # пароль администратора TL_USER (SSH; обязателен)
 TARGET_USER="${TARGET_USER:-}"       # кому назначить ключ (если пусто — берётся user из devices.conf для каждого хоста)
 # Группа, в которую должен входить целевой пользователь (вместо «full»).
-# По умолчанию — отдельная группа automation с МИНИМАЛЬНЫМ набором политик
+# По умолчанию — отдельная группа mikrogit с МИНИМАЛЬНЫМ набором политик
 # (TARGET_POLICY). Если задать пустым — права НЕ трогаются (только проверка).
-TARGET_GROUP="${TARGET_GROUP-automation}"
-# Политики группы TARGET_GROUP — применяются, когда группа создаётся этим
-# скриптом (если группы на роутере ещё нет). Существующая группа НЕ меняется.
+TARGET_GROUP="${TARGET_GROUP-mikrogit}"
+# Политики группы TARGET_GROUP. Если группы на роутере ещё нет — она создаётся
+# с этими политиками; если уже есть — в неё ДОБАВЛЯЮТСЯ недостающие требуемые
+# политики (лишние не снимаются).
 # Минимальный набор, достаточный для задач бота (бэкапы + проверка/установка
-# обновлений RouterOS через сам роутер + RouterBOOT): ssh,read,write,test,reboot,policy.
-TARGET_POLICY="${TARGET_POLICY-ssh,read,write,test,reboot,policy}"
+# обновлений RouterOS через сам роутер + RouterBOOT + заливка скрипта
+# хардненинга по scp): ssh,read,write,test,reboot,policy,ftp.
+TARGET_POLICY="${TARGET_POLICY-ssh,read,write,test,reboot,policy,ftp}"
 NEWUSER_PASS="${NEWUSER_PASS:-}"     # пароль для СОЗДАВАЕМОГО пользователя (если TARGET_USER не существует)
-SSH_PROBE="${SSH_PROBE:-1}"          # проверять ли SSH-вход перед telnet (1/0). 0 = всегда заходить по telnet
+SSH_PROBE="${SSH_PROBE:-1}"          # проверять ли вход целевым SSH-ключом (1/0); 0 = всегда полный прогон
 SSH_TIMEOUT="${SSH_TIMEOUT:-8}"      # таймаут SSH-проверки на устройство, сек
 SSH_VERIFY="${SSH_VERIFY:-1}"        # подтверждать ли ключ повторной SSH-проверкой после развёртывания
-# Транспорт входа АДМИНИСТРАТОРА (TL_USER) на роутер для развёртывания/правки прав:
-#   telnet — всегда telnet (:TL_PORT),  ssh — всегда ssh (:ssh-порт устройства),
-#   auto   — telnet, если порт открыт, иначе ssh (для роутеров с отключённым telnet).
-LOGIN_VIA="${LOGIN_VIA:-auto}"
-
 # ---------------------------------------------------------------------------
 # Разбор аргументов (--dry-run, --check, --force) и фильтр устройства
 # ---------------------------------------------------------------------------
@@ -96,7 +95,7 @@ for a in "$@"; do
         --force)   FORCE=1 ;;
         --help|-h)
             echo "Использование: $0 [--dry-run|--check|--force] [имя_устройства]"
-            echo "Env/конфиг: DEVICES_CONF, KEY_FILE, KEY_PRIV, TL_USER, TL_PORT, TL_PASS, TARGET_USER, TARGET_GROUP, TARGET_POLICY, NEWUSER_PASS, LOGIN_VIA, SSH_PROBE, SSH_TIMEOUT, SSH_VERIFY"
+            echo "Env/конфиг: DEVICES_CONF, KEY_FILE, KEY_PRIV, TL_USER, TL_PASS, TARGET_USER, TARGET_GROUP, TARGET_POLICY, NEWUSER_PASS, SSH_PROBE, SSH_TIMEOUT, SSH_VERIFY"
             exit 0 ;;
         --*) echo "Неизвестный аргумент: $a" >&2; exit 2 ;;
         *)
@@ -127,33 +126,28 @@ if [ ! -f "$KEY_PRIV" ]; then
     fi
     if [ "$SSH_PROBE" = "1" ]; then
         echo "WARN: приватный ключ не найден ($KEY_PRIV) — SSH-предпроверка отключена"
-        echo "      Скрипт будет разворачивать ключ на всех устройствах через telnet."
+        echo "      Скрипт будет разворачивать ключ на всех устройствах через SSH-вход администратора."
         SSH_PROBE=0
     fi
 fi
-# expect/telnet/TL_PASS проверяем ЛЕНИВО — только когда реально понадобится
-# заход по telnet (если все устройства уже настроены — они не нужны).
-_TELNET_OK=        # 1 = deps проверены и есть
-_TELNET_ERR=       # 1 = ошибка уже напечатана (не дублировать на каждый роутер)
+# expect/ssh/TL_PASS проверяем ЛЕНИВО — только когда реально понадобится
+# SSH-вход администратора (если все устройства уже настроены — они не нужны).
+_CLI_OK=         # 1 = deps проверены и есть
+_CLI_ERR=        # 1 = ошибка уже напечатана (не дублировать на каждый роутер)
 ensure_client_deps() {
-    # Перед реальным заходом администратора (telnet/ssh). Кэшируем expect/TL_PASS;
-    # сам клиент (telnet/ssh) проверяем под выбранный транспорт (это дёшево).
-    if [ -n "$_TELNET_ERR" ]; then return 1; fi
-    if [ -z "$_TELNET_OK" ]; then
+    # Перед реальным заходом администратора по SSH.
+    if [ -n "$_CLI_ERR" ]; then return 1; fi
+    if [ -z "$_CLI_OK" ]; then
         if ! command -v expect >/dev/null 2>&1; then
-            _TELNET_ERR=1; echo "ERROR: установите expect (apt-get install -y expect)" >&2; return 1
+            _CLI_ERR=1; echo "ERROR: установите expect (apt-get install -y expect)" >&2; return 1
+        fi
+        if ! command -v ssh >/dev/null 2>&1; then
+            _CLI_ERR=1; echo "ERROR: установите openssh-client (ssh)" >&2; return 1
         fi
         if [ -z "$TL_PASS" ]; then
-            _TELNET_ERR=1; echo "ERROR: задайте TL_PASS (пароль администратора $TL_USER)" >&2; return 1
+            _CLI_ERR=1; echo "ERROR: задайте TL_PASS (пароль администратора $TL_USER)" >&2; return 1
         fi
-        _TELNET_OK=1
-    fi
-    if [ "$1" = "ssh" ]; then
-        if ! command -v ssh >/dev/null 2>&1; then
-            echo "ERROR: установите openssh-client (ssh)" >&2; return 1
-        fi
-    elif ! command -v telnet >/dev/null 2>&1; then
-        echo "ERROR: установите telnet (apt-get install -y telnet)" >&2; return 1
+        _CLI_OK=1
     fi
     return 0
 }
@@ -170,10 +164,42 @@ ensure_utf8_locale() {
     fi
 }
 
-# Открыт ли TCP-порт (для выбора транспорта: telnet/ssh)
-tcp_open() {
-    [ -n "$2" ] || return 1
-    timeout "$SSH_TIMEOUT" bash -c "</dev/tcp/$1/$2" 2>/dev/null
+# Секреты, которые НЕ должны попадать в логи (добавляются по мере разбора).
+_SCR_SECRETS=()
+_scr_add_secret() {
+    local v="$1"
+    [ -n "$v" ] && [ "${#v}" -ge 4 ] && _SCR_SECRETS+=("$v")
+}
+
+# Вычистка потока лога от секретов (читает stdin, пишет в stdout).
+# $1..N — дополнительные значения для глушения (напр. сгенерированный пароль).
+scrub_secrets() {
+    local line s v inkey=0
+    local -a extra=("$@")
+    for v in "$TL_PASS" "$NEWUSER_PASS" "${extra[@]:-}"; do
+        _scr_add_secret "$v"
+    done
+    while IFS= read -r line; do
+        # многострочный приватный ключ — глушим целиком
+        if [ "$inkey" = "1" ]; then
+            if printf '%s' "$line" | grep -qE -- '-----END [A-Z ]*PRIVATE KEY-----'; then
+                inkey=0
+                echo "[SCRUBBED: private key block]"
+            fi
+            continue
+        fi
+        if printf '%s' "$line" | grep -qE -- '-----BEGIN [A-Z ]*PRIVATE KEY-----|OPENSSH PRIVATE KEY|-----BEGIN (RSA |EC |DSA |ENCRYPTED )?PRIVATE KEY-----'; then
+            inkey=1
+            continue
+        fi
+        # известные значения (пароли/токены из конфига и сгенерированные)
+        for s in "${_SCR_SECRETS[@]:-}"; do
+            [ -n "$s" ] && line="${line//"$s"/[SCRUBBED]}"
+        done
+        # типовые паттерны password=.../Password: .../passphrase .../mk-<ts>-<rand>
+        line="$(printf '%s' "$line" | sed -E 's/password="[^"]*"/password="[SCRUBBED]"/Ig; s/password=[^ "][^ ]*/password=[SCRUBBED]/Ig; s/mk-[0-9]+-[0-9]+/[SCRUBBED]/g; s/([Pp]assphrase[[:space:]]*[:=][[:space:]]*)[^ ]*/\1[SCRUBBED]/Ig')"
+        printf '%s\n' "$line"
+    done
 }
 
 KEY_TEXT=$(tr -d '\r\n' < "$KEY_FILE")
@@ -182,7 +208,7 @@ LOG="deploy_key_$(date +%Y%m%d_%H%M%S).log"
 echo "devices.conf : $DEVICES_CONF"
 echo "ключ         : $KEY_FILE"
 echo "SSH-проверка : $([ "$SSH_PROBE" = "1" ] && echo "вкл (${KEY_PRIV})" || echo "выкл")"
-echo "транспорт    : LOGIN_VIA=$LOGIN_VIA (админ $TL_USER входит по telnet:$TL_PORT; ssh — порт каждого устройства из devices.conf, поле 3)"; [ -n "$TL_PASS" ] || echo "WARN: TL_PASS не задан — вход администратора невозможен"
+echo "вход админа  : ssh $TL_USER@<ip> — порт каждого устройства из devices.conf, поле 3 (telnet удалён)"; [ -n "$TL_PASS" ] || echo "WARN: TL_PASS не задан — вход администратора невозможен"
 [ "$SSH_VERIFY" = "1" ] && [ "$SSH_PROBE" = "1" ] && echo "подтверждение: после развёртывания вход ключом проверяется повторно (SSH)"
 echo "целевой user : ${TARGET_USER:-<из devices.conf, поле 4>}"
 echo "права (группа): ${TARGET_GROUP:-<не менять, только проверка>}"
@@ -197,7 +223,7 @@ echo "лог          : $LOG"
 # SSH-предпроверка: входит ли приватный ключ на устройство под целевым user
 # (ключ уже есть — ставить не нужно). Но ПРАВА пользователя проверяются даже
 # при рабочем ключе (см. ssh_user_group + режим rights_only в deploy_one).
-# Возврат: 0 = да, ключ уже работает; 1 = нет (нужен заход по telnet)
+# Возврат: 0 = да, ключ уже работает; 1 = нет (нужен SSH-вход администратора)
 # ---------------------------------------------------------------------------
 ssh_key_works() {
     local host="$1" sport="$2" target="$3"
@@ -237,400 +263,393 @@ ssh_user_group() {
 }
 
 # ---------------------------------------------------------------------------
-# Обработка одного устройства через expect-сессию: вход администратора по
-# telnet или по ssh (в зависимости от $5; $6 — ssh-порт устройства).
+# Политики группы, в которой состоит пользователь, прочитанные по SSH одной
+# командой (сам пользователь задаёт запрос). RouterOS НЕ выполняет
+# многострочные команды через ssh-exec (документированное ограничение),
+# поэтому сначала читаем группу, затем политики — каждое ОДНОЙ строкой.
+# Печатает политики одной строкой; rc: 0 = прочитано, 1 = не удалось.
+# ---------------------------------------------------------------------------
+ssh_group_policy_of_user() {
+    local host="$1" sport="$2" target="$3" g out pol
+    g="$(ssh_user_group "$host" "$sport" "$target")" || return 1
+    [ -n "$g" ] || return 1
+    out=$(ssh -n -p "$sport" -i "$KEY_PRIV" \
+        -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+        -o HostKeyAlgorithms=+ssh-rsa \
+        -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout="$SSH_TIMEOUT" -o LogLevel=ERROR \
+        "$target@$host" ":put [/user group get [find name=$g] policy]" 2>/dev/null < /dev/null)
+    pol=$(printf '%s' "$out" | tr -d '\r' | grep -E '^"?[a-zA-Z][a-zA-Z0-9,; _-]*"?$' | tail -n1 | tr -d '"' | tr ';' ',' | tr -d ' ')
+    if [ -n "$pol" ]; then
+        printf '%s\n' "$pol"
+        return 0
+    fi
+    return 1
+}
+
+
+# Список требуемых политик (для точной проверки прав пользователя)
+need_policies() { echo "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp}"; }
+
+# Покрывает ли список политик $1 (через запятую) все требуемые из $2.
+pol_has_all() {
+    local pol="$1" req="$2" tok t
+    [ -z "$pol" ] && return 1
+    local IFS=,
+    for tok in $req; do
+        [ -z "$tok" ] && continue
+        local found=0
+        for t in $pol; do
+            [ "$t" = "$tok" ] && { found=1; break; }
+        done
+        [ "$found" = 0 ] && return 1
+    done
+    return 0
+}
+# ---------------------------------------------------------------------------
+# Обработка одного устройства. Вход администратора — ТОЛЬКО по SSH, причём
+# команды выполняются через ssh-exec: каждая команда ОДНОЙ строкой и ОТДЕЛЬНОЙ
+# сессией БЕЗ pty (ssh -T). Причина: интерактивная консоль RouterOS 6.49 по pty
+# заливает сессию ANSI-перерисовкой строки (эхо, [K, [9999B, [6n), из-за чего
+# разбор ответов и применение команд ненадёжны; ssh-exec без pty даёт чистый
+# вывод, но RouterOS (по документации) не принимает многострочные команды.
 # $4=rights_only: 1 = ключ уже работает, делается только проверка/доводка прав.
-# Коды возврата (rc) 0=успех (ключ назначен или уже был; права приведены);
-# 2=нет Login/запроса, 3=соединение закрыто, 4=нет запроса пароля,
-# 5=неверный логин/пароль, 6=нет приглашения/ответа роутера,
-# 7=не удалось создать пользователя, 8=не удалось назначить ключ,
-# 9=не удалось выдать/подтвердить права (группу).
+# rc: 0 = успех; 1 = ошибка (подробности в логе).
+# ---------------------------------------------------------------------------
+# Выполнить одну команду RouterOS (админ TL_USER) через ssh-exec без pty.
+# Пароль уходит только в stdin ssh (в лог/эхо не попадает).
+# Результат: stdout роутера -> $ADM_OUT, статус -> $ADM_RC
+# (0 = выполнено, 2 = недоступно/соединение, 3 = timeout, 4 = нет TL_PASS,
+#  5 = неверный пароль/доступ).
+# ---------------------------------------------------------------------------
+adm_exec() {
+    local host="$1" sport="$2" cmd="$3" out xrc
+    ADM_OUT=""; ADM_RC=0
+    if [ "${ADM_FAKE:-0}" = "1" ]; then          # локальный стенд (тесты, без сети)
+        ADM_OUT="$(fake_router "$cmd")"
+        ADM_RC=0
+        return 0
+    fi
+    [ -n "$TL_PASS" ] || { ADM_RC=4; return 1; }
+    out="$(ADM_HOST="$host" ADM_SPORT="$sport" ADM_LOGIN="$TL_USER" ADM_PASS="$TL_PASS" \
+        ADM_CMD="$cmd" expect <<'EXP' 2>&1
+set timeout 35
+log_user 0
+match_max 300000
+spawn ssh -T -p $env(ADM_SPORT) -o PreferredAuthentications=password \
+    -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
+    -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR $env(ADM_LOGIN)@$env(ADM_HOST) $env(ADM_CMD)
+set gotpw 0
+expect {
+    -re {[Pp]assword:} { send -- "$env(ADM_PASS)\r"; set gotpw 1 }
+    -re {[Pp]ermission denied} { exit 5 }
+    eof     { exit 2 }
+    timeout { exit 3 }
+}
+if {!$gotpw} { exit 2 }
+expect {
+    eof     { puts -nonewline $expect_out(buffer); exit 0 }
+    timeout { puts -nonewline $expect_out(buffer); exit 3 }
+}
+EXP
+)"
+    xrc=$?
+    ADM_OUT="$out"
+    case "$out" in
+        *"Permission denied"*)                                     ADM_RC=5 ;;
+        *"Connection refused"*|*"timed out"*|*"No route to host"*) ADM_RC=2 ;;
+        *)                                                         ADM_RC=$xrc ;;
+    esac
+    return "$ADM_RC"
+}
+
+# Последняя строка-значение из вывода :put (мусор баннера не проходит).
+put_val() { printf '%s\n' "$1" | tr -d '\r' | grep -E '^[A-Za-z0-9*][A-Za-z0-9*.,;:_+-]*$' | tail -n1; }
+
+# Есть ли в выводе ошибка RouterOS (используется для записывающих команд).
+out_err() {
+    printf '%s\n' "$1" | grep -Ei 'failure:|syntax error|bad command|no such command|unknown command|invalid|denied|unable|wrong|not found|no such item' >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
 deploy_one() {
-    local host="$1" tport="$2" target="$3" ro="$4" via="$5" sport_ssh="$6"
-    # $4: rights_only=1 — ключ уже работает, только проверить/починить права.
-    # $5: транспорт входа администратора: telnet|ssh; $6: ssh-порт (для ssh).
+    # $1 host  $2 ssh-порт  $3 target  $4 rights_only  $5 npass (для нового user)
+    local host="$1" sport="$2" target="$3" ro="$4" npass="$5"
+    local req_pol tgroup
+    req_pol="$(printf '%s' "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp}" | tr -d ' \t' | tr ';' ',')"
+    tgroup="${TARGET_GROUP:-}"
+
+    # ssh-exec одной строкой (без pty); вывод в ADM_OUT/ADM_RC
+    adm() { adm_exec "$host" "$sport" "$1"; }
+
+    # --- чтение версии RouterOS (в лог) ---
+    adm "/system resource print"
+    if [ "$ADM_RC" = "0" ]; then
+        local vr
+        vr="$(printf '%s\n' "$ADM_OUT" | tr -d '\r' | grep -oE 'version:[^A-Za-z]*[0-9]+\.[0-9]+' | head -n1)"
+        [ -n "$vr" ] && echo "[INFO] $vr"
+    fi
+
+    # --- гарантировать наличие группы (создать с TARGET_POLICY при отсутствии) ---
+    ensure_group_here() {
+        local g="$1"
+        adm ":put [/user group find name=$g]"
+        if [ "$ADM_RC" != "0" ]; then
+            echo "[ERR] нет ответа роутера при проверке группы '$g'"
+            return 1
+        fi
+        if [ -n "$(put_val "$ADM_OUT")" ]; then
+            echo "[INFO] группа '$g' уже существует"
+            return 0
+        fi
+        adm "/user group add name=$g policy=$req_pol"
+        if [ "$ADM_RC" != "0" ] || out_err "$ADM_OUT"; then
+            echo "[ERR] не удалось создать группу '$g': $(printf '%s' "$ADM_OUT" | head -c 300)"
+            return 1
+        fi
+        echo "[INFO] группа '$g' отсутствовала — создана с политиками: $req_pol"
+        return 0
+    }
+
+    # --- политики группы: сначала :put get, при неудаче print detail ---
+    # Результат: POL_TXT (csv) и POL_RC.
+    pol_read() {
+        local g="$1" p=""
+        POL_TXT=""; POL_RC=1
+        [ -z "$g" ] && return 1
+        adm ":put [/user group get [find name=$g] policy]"
+        if [ "$ADM_RC" = "0" ]; then
+            p="$(printf '%s\n' "$ADM_OUT" | tr -d '\r' | grep -E '^"?[A-Za-z][A-Za-z0-9,; _-]*"?$' | tail -n1 | tr -d '"')"
+        fi
+        if [ -z "$p" ]; then
+            adm "/user group print detail where name=$g"
+            if [ "$ADM_RC" = "0" ]; then
+                p="$(printf '%s\n' "$ADM_OUT" | tr -d '\r' | grep -F "name=\"$g\"" | grep -oE 'policy="[^"]*"' | head -n1 | sed -E 's/^policy="(.*)"$/\1/')"
+            fi
+        fi
+        p="$(printf '%s' "$p" | tr -d ' \t' | tr ';' ',' | sed -E 's/,+$//')"
+        POL_TXT="$p"
+        [ -n "$p" ] && { POL_RC=0; return 0; }
+        return 1
+    }
+
+    # --- ключ способом file+import (RouterOS 6.43+); 0 = ок ---
+    install_key_import() {
+        adm "/file print file=mkkey.txt"          # гарантируем наличие файла
+        [ "$ADM_RC" = "0" ] || { echo "[WARN] не удалось создать файл mkkey.txt"; return 1; }
+        adm "/file set mkkey.txt contents=\"$KEY_TEXT\""
+        if [ "$ADM_RC" != "0" ] || out_err "$ADM_OUT"; then
+            adm "/file print file=mkkey.txt"
+            adm "/file set mkkey.txt contents=\"$KEY_TEXT\""
+            if [ "$ADM_RC" != "0" ] || out_err "$ADM_OUT"; then
+                echo "[WARN] не удалось записать ключ в файл mkkey.txt"
+                return 1
+            fi
+        fi
+        adm "/user ssh-keys import user=$target public-key-file=mkkey.txt"
+        local imout="$ADM_OUT" imrc="$ADM_RC"
+        adm "/file remove [find name=mkkey.txt]"
+        if [ "$imrc" != "0" ] || out_err "$imout"; then
+            echo "[WARN] file+import не принят роутером: $(printf '%s' "$imout" | head -c 200)"
+            return 1
+        fi
+        if printf '%s\n' "$imout" | grep -qiE 'already|unchanged'; then
+            echo "[OK] ключ уже был установлен ранее ($target) — повторно не добавляем"
+        else
+            echo "[INFO] ключ импортирован пользователю $target (file+import)"
+        fi
+        return 0
+    }
+
+    # --- недостающие требуемые политики (csv; пусто = все на месте) ---
+    missing_policies_csv() {
+        local pol="$1" req="$2" miss="" tok t
+        if [ -z "$pol" ]; then printf '%s' "$req"; return 0; fi
+        local IFS=,
+        for tok in $req; do
+            [ -z "$tok" ] && continue
+            local found=0
+            for t in $pol; do
+                if [ "$t" = "$tok" ]; then found=1; break; fi
+            done
+            if [ "$found" = "0" ]; then
+                if [ -n "$miss" ]; then miss="$miss,$tok"; else miss="$tok"; fi
+            fi
+        done
+        printf '%s' "$miss"
+    }
+
+    # --- гарантировать, что группа $1 покрывает требуемые политики $2 ---
+    # Читаем политики группы и добавляем недостающие (дополнение, не замена).
+    # Если чтение политик на роутере не работает (старые RouterOS 6 / нет прав
+    # на просмотр) — группу принудительно приводим к полному требуемому набору:
+    # это проектная группа под backupUser, а иначе хардненинг не сможет заливать
+    # скрипты по scp (RouterOS даёт file-доступ только при политике ftp).
+    grp_fill_pol() {
+        local g="$1" req="$2" cur miss
+        [ -z "$g" ] && return 0
+        cur=""
+        pol_read "$g" && cur="$POL_TXT"
+        miss="$(missing_policies_csv "$cur" "$req")"
+        if [ -z "$miss" ]; then
+            return 0
+        fi
+        if [ -n "$cur" ]; then
+            adm "/user group set [find name=$g] policy=$cur,$miss"
+            if [ "$ADM_RC" != "0" ] || out_err "$ADM_OUT"; then
+                echo "[WARN] не удалось дополнить группу '$g' политиками: $miss"
+                return 1
+            fi
+            echo "[INFO] группа '$g' дополнена политиками: $miss"
+        else
+            adm "/user group set [find name=$g] policy=$req"
+            if [ "$ADM_RC" != "0" ] || out_err "$ADM_OUT"; then
+                echo "[WARN] не удалось установить группе '$g' требуемые политики ($req): $(printf '%s' "$ADM_OUT" | head -c 200)"
+                return 1
+            fi
+            echo "[INFO] группа '$g' — политики не читались; установлен требуемый набор: $req"
+        fi
+        return 0
+    }
+
+    # --- проверка/доводка прав ---
+    do_rights_fix() {
+        local cur pol_cur
+        # текущая группа пользователя
+        cur=""
+        adm ":put [/user get [find name=$target] group]"
+        if [ "$ADM_RC" = "0" ]; then cur="$(put_val "$ADM_OUT")"; fi
+        echo "[INFO] текущая группа пользователя '$target': ${cur:-не определена}"
+
+        # политики текущей группы
+        pol_cur=""
+        if [ -n "$cur" ]; then
+            pol_read "$cur" && pol_cur="$POL_TXT"
+        fi
+        if [ -n "$pol_cur" ]; then
+            echo "[INFO] группа '$cur' — политики: $pol_cur"
+        else
+            echo "[INFO] группа '${cur:-?}' — политики не прочитаны/пусты"
+        fi
+
+        # решаем, нужен ли перевод в целевую группу
+        local need_fix=0 reason=""
+        if [ -n "$tgroup" ] && [ -n "$cur" ]; then
+            if [ "$cur" != "$tgroup" ]; then
+                # 'full' — всегда уводим (нужны минимальные права, не все);
+                # прочие группы — только если политик не хватает или они не читаются
+                if [ "$cur" = "full" ] || [ -z "$pol_cur" ] || \
+                   [ -n "$(missing_policies_csv "$pol_cur" "$req_pol")" ]; then
+                    need_fix=1
+                    reason="текущая группа '$cur' не подходит (нужна '$tgroup' с политиками $req_pol)"
+                fi
+            fi
+        elif [ -n "$tgroup" ] && [ "$ro" = "1" ] && [ -z "$cur" ]; then
+            need_fix=1
+            reason="текущая группа не определяется"
+        fi
+
+        if [ "$need_fix" = "1" ]; then
+            if ! ensure_group_here "$tgroup"; then return 1; fi
+            # целевая группа должна покрывать требуемые политики (в т.ч. ftp для scp-загрузки)
+            grp_fill_pol "$tgroup" "$req_pol" || true
+
+            echo "[INFO] перевожу пользователя '$target' в группу '$tgroup' ($reason)"
+            adm "/user set [find name=$target] group=$tgroup"
+            if [ "$ADM_RC" != "0" ] || out_err "$ADM_OUT"; then
+                echo "[ERR] не удалось изменить группу пользователя $target: $(printf '%s' "$ADM_OUT" | head -c 300)"
+                return 1
+            fi
+            # контроль: перечитать группу; при расхождении — одна повторная попытка
+            local rb=""
+            adm ":put [/user get [find name=$target] group]"
+            if [ "$ADM_RC" = "0" ]; then rb="$(put_val "$ADM_OUT")"; fi
+            if [ "$rb" != "$tgroup" ]; then
+                adm "/user set [find name=$target] group=$tgroup"
+                adm ":put [/user get [find name=$target] group]"
+                if [ "$ADM_RC" = "0" ]; then rb="$(put_val "$ADM_OUT")"; fi
+            fi
+            if [ "$rb" = "$tgroup" ]; then
+                echo "[INFO] группа пользователя '$target' подтверждена в сессии: $rb"
+                cur="$rb"
+            else
+                echo "[WARN] группа после установки = '${rb:-не читается}' (ожидалось '$tgroup') — итог решит SSH-контроль"
+                cur="${rb:-$cur}"
+            fi
+        else
+            if [ -n "$tgroup" ] && [ "$cur" = "$tgroup" ]; then
+                # уже в целевой группе — довести её политики до требуемых
+                grp_fill_pol "$tgroup" "$req_pol" || true
+                local fpol=""
+                pol_read "$tgroup" && fpol="$POL_TXT"
+                if [ -n "$fpol" ] && [ -z "$(missing_policies_csv "$fpol" "$req_pol")" ]; then
+                    echo "[INFO] права в порядке: пользователь уже в группе '$tgroup', требуемые политики на месте"
+                fi
+            elif [ -n "$pol_cur" ] && [ -z "$(missing_policies_csv "$pol_cur" "$req_pol")" ]; then
+                echo "[INFO] права достаточны: группа '$cur' уже даёт все требуемые политики ($req_pol)"
+            else
+                echo "[INFO] права не меняю (TARGET_GROUP не задан или группа не определяется)"
+            fi
+        fi
+
+        if [ "$ro" = "1" ]; then
+            echo ""
+            echo "[OK] права пользователя '$target' проверены и достаточны (группа: ${cur:-?})"
+        else
+            echo ""
+            echo "[OK] ключ установлен → $target на $host"
+        fi
+        return 0
+    }
 
     if [ "$DRY_RUN" = "1" ]; then
         if [ "$ro" = "1" ]; then
-            echo "[dry] $host — вход по $via, правка прав → $target"
+            echo "[dry] $host — вход по ssh, правка прав → $target"
         else
-            echo "[dry] $host — вход по $via, ключ → $target"
+            echo "[dry] $host — вход по ssh, ключ → $target"
         fi
         return 0
     fi
 
-    DU_HOST="$host" DU_PORT="$tport" DU_LOGIN="$TL_USER" DU_TARGET="$target" \
-    DU_PASS="$TL_PASS" DU_KEY="$KEY_TEXT" DU_NPASS="${NEWUSER_PASS:-mk-$(date +%s)-$RANDOM}" DU_GROUP="$TARGET_GROUP" DU_POLICY="$TARGET_POLICY" DU_RO="$ro" \
-    DU_VIA="$via" DU_SPORT="$sport_ssh" \
-expect <<'EXP' 2>&1 | tee -a "$LOG"
-set timeout 45
-set host   $env(DU_HOST)
-set port   $env(DU_PORT)
-set login  $env(DU_LOGIN)
-set target $env(DU_TARGET)
-set pass   $env(DU_PASS)
-set key    $env(DU_KEY)
-set npass  $env(DU_NPASS)
-set tgroup $env(DU_GROUP)
-set tpol   $env(DU_POLICY)
-set via    $env(DU_VIA)
-set sport  $env(DU_SPORT)
-set ro     $env(DU_RO)
-set vmajor 0
-set vminor 0
+    # --- полная установка (ro=0): пользователь + ключ ---
+    if [ "$ro" != "1" ]; then
+        local has_user=1
+        adm ":put [/user find name=$target]"
+        if [ "$ADM_RC" != "0" ] || [ -z "$(put_val "$ADM_OUT")" ]; then
+            has_user=0
+        fi
+        if [ "$has_user" = "0" ]; then
+            echo "[INFO] пользователь '$target' на роутере не найден — создаю"
+            local ugroup="$tgroup"
+            [ -n "$ugroup" ] || ugroup="full"
+            if [ -n "$tgroup" ]; then
+                ensure_group_here "$tgroup" || return 1
+            fi
+            adm "/user add name=$target group=$ugroup password=\"$npass\""
+            if [ "$ADM_RC" != "0" ] || out_err "$ADM_OUT"; then
+                echo "[ERR] не удалось создать пользователя $target: $(printf '%s' "$ADM_OUT" | head -c 300)"
+                return 1
+            fi
+            echo "[INFO] создан пользователь '$target' (группа $ugroup)"
+        else
+            echo "[INFO] пользователь '$target' уже есть — устанавливаю только ключ/права"
+        fi
 
-# ВАЖНО: всё распознаётся "в потоке" (expect-паттерны матчатся по мере прихода
-# данных, страницы --More-- листаются). Полагаться на expect_out(buffer)
-# нельзя: при листании страниц его содержимое ненадёжно.
+        # ключ: file+import (6.43+); при неудаче — inline
+        if ! install_key_import; then
+            echo "[WARN] способ file+import не сработал — пробую inline"
+            adm "/user set [find name=$target] ssh-key=\"$KEY_TEXT\""
+            if [ "$ADM_RC" != "0" ] || out_err "$ADM_OUT"; then
+                echo "[ERR] не удалось назначить SSH-ключ пользователю $target"
+                return 1
+            fi
+            echo "[INFO] ключ назначен inline (старый RouterOS)"
+        fi
+    fi
 
-# --- дождаться приглашения, пролистав --More-- (вывод команды не нужен) ---
-# ---------------------------------------------------------------------------
-# Драйвер telnet-сессии: каждая команда = send + ожидание приглашения.
-# Если приглашение не пришло — "покалываем" Enter (до 6 раз), чтобы снять
-# рассинхрон, и только потом считаем ошибкой.
-# Полный буфер ответа (эхо + вывод) кладётся в глобальную cmd_out.
-# ---------------------------------------------------------------------------
-proc run_cmd {cmd} {
-    global cmd_out
-    set cmd_out ""
-    send -- "$cmd\r"
-    set ok 0
-    set n 0
-    while {$n < 6} {
-        incr n
-        expect {
-            -re {--[Mm]ore--} { send -- " "; exp_continue }
-            -re "\] >"        { set ok 1; break }
-            timeout           { send -- "\r" }
-            eof               { break }
-        }
-    }
-    if {!$ok} { return 1 }
-    set cmd_out $expect_out(buffer)
-    return 0
-}
-
-# Вытащить значение, которое роутер напечатал в ответ на команду $cmd
-# (между эхом команды и приглашением).
-proc cmd_value {cmd} {
-    global cmd_out
-    set b $cmd_out
-    set cut [string last "] >" $b]
-    if {$cut >= 0} {
-        set b [string range $b 0 [expr {$cut - 1}]]
-        set cut2 [string last "\[" $b]
-        set nl [string last "\n" $b]
-        if {$cut2 >= 0 && $nl < $cut2} { set b [string range $b 0 [expr {$cut2 - 1}]] }
-    }
-    set e [string last $cmd $b]
-    if {$e >= 0} { set b [string range $b [expr {$e + [string length $cmd]}] end] }
-    set b [string trim $b " \t\r\n"]
-    return [lindex [split $b "\n"] 0]
-}
-
-# --- есть ли пользователь в /user print ---
-# Вывод бывает: legacy/detail "name=\"x\" ..." либо табличный " 1  backupUser  ..."
-proc user_exists {target} {
-    global cmd_out has_user
-    set has_user 0
-    if {[run_cmd "/user print"] != 0} { return 1 }
-    set p1 [format {name="?%s"?} $target]
-    set p2 [format {(^|\n)[ \t]*[0-9]+[ \t]+%s[ \t]} $target]
-    if {[regexp -nocase $p1 $cmd_out] || [regexp -nocase $p2 $cmd_out]} {
-        set has_user 1
-    }
-    return 0
-}
-
-# --- существует ли группа ---
-# Печатает через :put id группы (пусто = группы нет). Прокидывает has_group.
-proc group_exists {gname} {
-    global cmd_out has_group
-    set has_group 0
-    set gfind [format {:put [/user group find name=%s]} $gname]
-    if {[run_cmd $gfind] != 0} { return 1 }
-    set gv [string trim [cmd_value $gfind]]
-    if {[string length $gv] > 0} { set has_group 1 }
-    return 0
-}
-
-# --- убедиться, что группа есть; если нет — создать с политиками TARGET_POLICY
-# Существующую группу НЕ переопределяем (вдруг она используется ещё кем-то):
-# проверяем только членство пользователя. gp_created=1 — группу создали сейчас.
-proc ensure_group {gname gpol} {
-    global cmd_out gp_ok gp_msg gp_created has_group
-    set gp_ok 1
-    set gp_msg ""
-    set gp_created 0
-    if {[string length $gname] == 0} { return 0 }
-    if {[group_exists $gname] != 0} { return 1 }
-    if {!$has_group} {
-        set cmd [format {/user group add name=%s policy=%s} $gname $gpol]
-        if {[run_cmd $cmd] != 0} { return 1 }
-        if {[regexp -nocase {failure:|no such|denied|invalid|unable|bad command|unknown} $cmd_out]} {
-            set gp_ok 0
-            append gp_msg $cmd_out
-            return 0
-        }
-        set gp_created 1
-    }
-    return 0
-}
-
-# --- создать пользователя (в группе $group) ---
-proc user_add {target pass group} {
-    global cmd_out add_ok add_msg
-    set add_ok 1
-    set add_msg ""
-    set cmd [format {/user add name=%s group=%s password="%s"} $target $group $pass]
-    if {[run_cmd $cmd] != 0} { return 1 }
-    if {[regexp -nocase {failure:|no such|invalid|unable|denied|wrong} $cmd_out]} {
-        set add_ok 0
-        append add_msg $cmd_out
-    }
-    return 0
-}
-
-# --- способ 1: file + import (RouterOS 6.43+ / 7) ---
-proc do_import {target key} {
-    global cmd_out imp_status imp_msg
-    set imp_status ok
-    set imp_msg ""
-    if {[run_cmd "/file print file=mkkey"] != 0} { return 1 }
-    set setc [format {/file set mkkey.txt contents="%s"} $key]
-    if {[run_cmd $setc] != 0} { return 1 }
-    set impc [format {/user ssh-keys import user=%s public-key-file=mkkey.txt} $target]
-    if {[run_cmd $impc] != 0} { return 1 }
-    set buf $cmd_out
-    if {[regexp -nocase {already exists|unchanged} $buf]} {
-        set imp_status already
-    } elseif {[regexp -nocase {failure:|no such command|bad command|unknown command|not found|invalid|denied|unable|wrong format} $buf]} {
-        set imp_status fail
-        append imp_msg $buf
-    }
-    # убрать рабочий файл, если RouterOS его не съел сам
-    run_cmd "/file remove \[find name=mkkey.txt\]"
-    return 0
-}
-
-# --- способ 2: inline (только старый RouterOS 6 <6.43) ---
-proc do_inline {target key} {
-    global cmd_out inl_ok inl_msg
-    set inl_ok 1
-    set inl_msg ""
-    set cmd [format {/user set [find name=%s] ssh-key="%s"} $target $key]
-    if {[run_cmd $cmd] != 0} { return 1 }
-    if {[regexp -nocase {failure:|no such|bad command|unknown command|not found|invalid|denied|unable|wrong} $cmd_out]} {
-        set inl_ok 0
-        append inl_msg $cmd_out
-    }
-    return 0
-}
-
-# --- запасной запрос версии (если не распознана из баннера) ---
-proc get_version {} {
-    global cmd_out vmajor vminor
-    set vmajor 0
-    set vminor 0
-    if {[run_cmd "/system resource print"] != 0} { return 1 }
-    if {[regexp -nocase {version:[ \t]*([0-9]+)\.([0-9]+)} $cmd_out -> mj mn]} {
-        set vmajor $mj
-        set vminor $mn
-    }
-    return 0
-}
-
-# --- соединение + логин администратора (telnet или ssh) ---
-# Для telnet: host:port, запрос Login, затем Password.
-# Для ssh: ssh-клиент сам передаёт логин (login@host), RouterOS спросит Password.
-if {$via eq "ssh"} {
-    spawn ssh -p $sport -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR $login@$host
-} else {
-    spawn telnet $host $port
-}
-# фаза 1: Login (telnet) / Password (ssh) / уже приглашение
-expect {
-    -re {[Ll]ogin:}   { send -- "$login\r"; exp_continue }
-    -re {[Pp]assword:} { send -- "$pass\r" }
-    -re "\] >"        { }
-    timeout { puts "\n\[ERR\] нет Login/приглашения (служба закрыта?)"; exit 2 }
-    eof     { puts "\n\[ERR\] соединение закрыто (недоступен порт?)"; exit 3 }
-}
-# фаза 2: баннер + приглашение. Если после входа RouterOS снова спрашивает
-# Login/Password (напр. sshd с доп. консолью, или неверный пароль) — отвечаем,
-# но не более 3 попыток (иначе rc=5). Ловим версию из баннера.
-set tries 0
-expect {
-    -re {RouterOS[ \t]+([0-9]+)\.([0-9]+)} {
-        set vmajor $expect_out(1,string)
-        set vminor $expect_out(2,string)
-        exp_continue
-    }
-    -re {--[Mm]ore--} { send -- " "; exp_continue }
-    -re "\] >"        { }
-    -re {[Ll]ogin:}    {
-        if {$tries < 3} { incr tries; send -- "$login\r"; exp_continue }
-        puts "\n\[ERR\] неверный логин/пароль"; exit 5
-    }
-    -re {[Pp]assword:} {
-        if {$tries < 3} { incr tries; send -- "$pass\r"; exp_continue }
-        puts "\n\[ERR\] неверный логин/пароль"; exit 5
-    }
-    -re {[Pp]ermission denied} { puts "\n\[ERR\] неверный логин/пароль"; exit 5 }
-    timeout           { puts "\n\[ERR\] нет приглашения роутера"; exit 6 }
-    eof               { puts "\n\[ERR\] нет приглашения роутера"; exit 6 }
-}
-puts "\[OK\] вошли на $host ($via)"
-
-# --- версия RouterOS: из баннера либо запасной запрос ---
-set version_src banner
-if {$vmajor == 0} {
-    get_version
-    set version_src "resource print"
-}
-puts "\[INFO\] RouterOS $vmajor.$vminor ($version_src)"
-
-
-# --- целевой пользователь: создать, если нет ---
-if {$ro != 1} {
-    # полная установка: создать пользователя (если нет) и назначить ключ.
-    # При rights_only (ro=1, ключ уже работает) переходим сразу к проверке прав.
-if {[user_exists $target] != 0} { puts "\n\[ERR\] нет ответа роутера"; exit 6 }
-if {$has_user == 0} {
-    # группа для нового пользователя: TARGET_GROUP (если задана) либо full
-    # (TARGET_GROUP пуст = «правами не управляю», берём стандартную full).
-    set ugroup $tgroup
-    if {[string length $ugroup] == 0} { set ugroup "full" }
-    # перед созданием пользователя/перевода в группу — убедиться, что группа есть
-    if {[string length $tgroup] > 0} {
-        if {[ensure_group $tgroup $tpol] != 0} { puts "\n\[ERR\] нет ответа роутера"; exit 7 }
-        if {!$gp_ok} {
-            puts "\n\[ERR\] не удалось создать группу '$tgroup': $gp_msg"
-            send -- "quit\r"
-            exit 7
-        }
-        if {$gp_created} {
-            puts "\[INFO\] группа '$tgroup' отсутствовала — создана с политиками: $tpol"
-        }
-    }
-    puts "\[INFO\] пользователь '$target' не найден — создаю (группа $ugroup)"
-    if {[user_add $target $npass $ugroup] != 0} { puts "\n\[ERR\] нет ответа роутера"; exit 7 }
-    if {$add_ok == 0} {
-        puts "\n\[ERR\] не удалось создать пользователя $target: $add_msg"
-        send -- "quit\r"
-        exit 7
-    }
-    puts "\[INFO\] создан пользователь $target (пароль задан, но бот входит по ключу)"
-}
-
-# --- выбор способа и назначение ключа ---
-set method inline
-if {$vmajor > 6 || ($vmajor == 6 && $vminor >= 43) || $vmajor == 0} {
-    # 6.43+ / 7 (или версия неизвестна) -> file+import; при неудаче fallback на inline
-    set method import
-    if {[do_import $target $key] != 0} { puts "\n\[ERR\] нет ответа роутера"; exit 8 }
-    if {$imp_status eq "already"} {
-        puts "\[OK\] ключ уже был установлен ранее ($target) — повторно не добавляем"
-    } elseif {$imp_status eq "fail"} {
-        puts "\[WARN\] import не прошёл ($imp_msg), пробую inline..."
-        set method inline
-    }
-}
-if {$method eq "inline"} {
-    if {[do_inline $target $key] != 0} { puts "\n\[ERR\] нет ответа роутера"; exit 8 }
-    if {$inl_ok == 0} {
-        puts "\n\[ERR\] НЕ удалось назначить ключ пользователю $target: $inl_msg"
-        send -- "quit\r"
-        exit 8
-    }
-    puts "\[INFO\] ключ назначен inline (старый RouterOS)"
-}
-
-}
-
-# --- ПРОВЕРКА ПРАВ целевого пользователя (группа и политики) ---
-# Требуемая группа приходит в $tgroup (bash: TARGET_GROUP, по умолчанию full).
-# Если $tgroup пусто — права не меняем, только показываем текущие.
-set cur_group ""
-set gcmd [format {:put [/user get [find name=%s] group]} $target]
-if {[run_cmd $gcmd] != 0} { puts "\n\[ERR\] нет ответа роутера"; exit 6 }
-set cur_group [string trim [cmd_value $gcmd]]
-set gmsg "не определена"
-if {[string length $cur_group] > 0} { set gmsg $cur_group }
-puts "\[INFO\] текущая группа пользователя '$target': $gmsg"
-
-set need_set 0
-if {[string length $tgroup] > 0} {
-    if {[string length $cur_group] == 0 || $cur_group ne $tgroup} {
-        set need_set 1
-    }
-}
-if {$need_set} {
-    # группа может отсутствовать (в т.ч. при rights_only-режиме) — создаём с TARGET_POLICY
-    if {[ensure_group $tgroup $tpol] != 0} { puts "\n\[ERR\] нет ответа роутера"; exit 9 }
-    if {!$gp_ok} {
-        puts "\n\[ERR\] не удалось создать группу '$tgroup': $gp_msg"
-        send -- "quit\r"
-        exit 9
-    }
-    if {$gp_created} {
-        puts "\[INFO\] группа '$tgroup' отсутствовала — создана с политиками: $tpol"
-    }
-    puts "\[INFO\] задаю пользователю '$target' группу: $tgroup (минимальные политики: $tpol)"
-    set scmd [format {/user set [find name=%s] group=%s} $target $tgroup]
-    if {[run_cmd $scmd] != 0} { puts "\n\[ERR\] нет ответа роутера"; exit 9 }
-    if {[regexp -nocase {failure:|no such|denied|invalid|unable|not found|unknown} $cmd_out]} {
-        puts "\n\[ERR\] не удалось изменить группу пользователя $target: $cmd_out"
-        send -- "quit\r"
-        exit 9
-    }
-    # контроль: перечитать группу
-    set gcmd2 [format {:put [/user get [find name=%s] group]} $target]
-    if {[run_cmd $gcmd2] != 0} { puts "\n\[ERR\] нет ответа роутера"; exit 9 }
-    set new_group [string trim [cmd_value $gcmd2]]
-    if {$new_group ne $tgroup} {
-        puts "\n\[ERR\] группа пользователя $target после установки: '$new_group' (ожидалось '$tgroup')"
-        send -- "quit\r"
-        exit 9
-    }
-    set cur_group $new_group
-    puts "\[INFO\] права обновлены: группа '$target' = $cur_group"
-}
-
-# --- показать политики группы (что реально умеет пользователь) ---
-set pol ""
-if {[string length $cur_group] > 0} {
-    set pcmd [format {:put [/user group get [find name=%s] policy]} $cur_group]
-    if {[run_cmd $pcmd] == 0} {
-        set pol [cmd_value $pcmd]
-    }
-}
-if {[string length $pol] > 0} {
-    puts "\[INFO\] политики группы '$cur_group': $pol"
-    # сверяем с требуемыми политиками TARGET_POLICY (или дефолтным минимумом)
-    set req_pol $tpol
-    if {[string length $req_pol] == 0} { set req_pol "ssh,read,write,test,reboot,policy" }
-    foreach need [split $req_pol ","] {
-        set need [string trim $need]
-        if {[string length $need] == 0} { continue }
-        if {![regexp -nocase "(^|\[ ,\])${need}(\[ ,\]|$)" $pol]} {
-            puts "\[WARN\] в группе '$cur_group' не видно политики '$need' — возможны проблемы при обновлении/бэкапе"
-        }
-    }
-} else {
-    puts "\[WARN\] не удалось получить политики группы '$cur_group'"
-}
-
-send -- "quit\r"
-if {$ro == 1} {
-    puts "\n\[OK\] права пользователя '$target' приведены к группе '$tgroup' ($host)"
-} else {
-    puts "\n\[OK\] ключ установлен → $target на $host"
-}
-exit 0
-
-EXP
+    # --- права ---
+    do_rights_fix
     return $?
 }
 
@@ -654,20 +673,22 @@ while IFS=':' read -r name ip port user desc; do
         continue
     fi
     # SSH-порт устройства берётся из devices.conf (3-е поле). Используется
-    # ВЕЗДЕ, где деплой ходит по SSH: предпроверка ключа, чтение прав, выбор
-    # транспорта (LOGIN_VIA=auto/ssh) и сам вход администратора. Пустое поле
-    # (или отсутствие) = стандартный порт 22.
+    # ВЕЗДЕ, где деплой ходит по SSH: предпроверка ключа, чтение прав и вход
+    # администратора. Пустое поле (или отсутствие) = стандартный порт 22.
     ssh_port="${port:-22}"
 
     # --- режим --check: только сообщаем, есть ли уже рабочий ключ ---
     if [ "$CHECK_ONLY" = "1" ]; then
         if ssh_key_works "$ip" "$ssh_port" "$local_target"; then
-            g="?"
-            if [ -n "$TARGET_GROUP" ]; then g=$(ssh_user_group "$ip" "$ssh_port" "$local_target" 2>/dev/null) || g="?"; fi
-            if [ -n "$TARGET_GROUP" ] && [ "$g" = "$TARGET_GROUP" ]; then
-                echo "[check] [$name] $ip — ✅ ключ работает, права OK (группа $g)"
-            elif [ -n "$TARGET_GROUP" ]; then
-                echo "[check] [$name] $ip — ⚠️ ключ работает, но права НЕ те (группа '$g', нужно $TARGET_GROUP) — нужен прогон"
+            g="?"; pol=""
+            if [ -n "$TARGET_GROUP" ]; then
+                g=$(ssh_user_group "$ip" "$ssh_port" "$local_target" 2>/dev/null) || g="?"
+                pol=$(ssh_group_policy_of_user "$ip" "$ssh_port" "$local_target" 2>/dev/null) || pol=""
+                if pol_has_all "$pol" "$(need_policies)"; then
+                    echo "[check] [$name] $ip — ✅ ключ работает, права достаточны (группа '$g', политики: $pol)"
+                else
+                    echo "[check] [$name] $ip — ⚠️ ключ работает, но прав НЕ хватает/не подтверждено (группа '${g:-?}', политики: ${pol:-не прочитаны}) — нужен прогон"
+                fi
             else
                 echo "[check] [$name] $ip — ✅ ключ уже работает (права не проверяем: TARGET_GROUP пуст)"
             fi
@@ -681,6 +702,7 @@ while IFS=':' read -r name ip port user desc; do
 
     # --- предпроверка SSH ---
     rights_only=0
+    known=""   # текущая группа из SSH-предпроверки (резерв; в ssh-exec не используется)
     if [ "$SSH_PROBE" = "1" ]; then
         if ssh_key_works "$ip" "$ssh_port" "$local_target"; then
             # Ключ уже работает — ставить нечего. Но ПРАВА проверяем ВСЕГДА:
@@ -692,11 +714,15 @@ while IFS=':' read -r name ip port user desc; do
                 SKIP=$((SKIP+1)); continue
             fi
             g=$(ssh_user_group "$ip" "$ssh_port" "$local_target") || g=""
-            if [ -n "$g" ] && [ "$g" = "$TARGET_GROUP" ]; then
-                echo "====> [$name] $ip — ✅ ключ работает и права в порядке ($local_target: группа '$g'), пропуск"
+            known="$g"
+            # Точная проверка прав: сравниваем НЕ имя группы, а её реальные политики
+            # (у пользователя может быть группа 'forbackup', уже дающая нужные права).
+            pol=$(ssh_group_policy_of_user "$ip" "$ssh_port" "$local_target" 2>/dev/null) || pol=""
+            if pol_has_all "$pol" "$(need_policies)"; then
+                echo "====> [$name] $ip — ✅ ключ работает и права достаточны ($local_target: группа '$g', политики покрывают требуемые) — пропуск"
                 SKIP=$((SKIP+1)); continue
             fi
-            echo "====> [$name] $ip — ✅ ключ работает, но права НЕ те (группа '${g:-?}') — исправляю права"
+            echo "====> [$name] $ip — ✅ ключ работает, но прав НЕ хватает/не подтверждено (группа '${g:-?}', политики: ${pol:-не прочитаны}) — захожу проверить/исправить"
             rights_only=1
         else
             echo "====> [$name] $ip — ключа нет, нужен вход администратора (ключ → $local_target)"
@@ -705,59 +731,40 @@ while IFS=':' read -r name ip port user desc; do
         echo "====> [$name] $ip (без SSH-предпроверки)  ключ → $local_target"
     fi
 
-    # --- выбор транспорта входа администратора (telnet/ssh) ---
+    # --- вход администратора: ТОЛЬКО по SSH (telnet удалён) ---
     # Сюда попадаем только если реально нужен вход на роутер.
-    case "$LOGIN_VIA" in
-        telnet) via="telnet" ;;
-        ssh)    via="ssh" ;;
-        auto)
-            if tcp_open "$ip" "$TL_PORT"; then
-                via="telnet"
-            elif tcp_open "$ip" "$ssh_port"; then
-                via="ssh"
-            else
-                via=""
-            fi ;;
-        *) echo "ERROR: LOGIN_VIA=$LOGIN_VIA (допустимо: auto|telnet|ssh)" >&2
-           exit 1 ;;
-    esac
-    if [ -z "$via" ]; then
-        echo "[$name] $ip — недоступны ни telnet(:$TL_PORT) ни ssh(:$ssh_port) — пропуск"
-        FAIL=$((FAIL+1))
-        continue
-    fi
-    if [ "$via" = "ssh" ]; then
-        admin_port="$ssh_port"
-    else
-        admin_port="$TL_PORT"
-    fi
-    echo "      вход: $via $TL_USER@$ip:$admin_port"
+    via="ssh"
+    admin_port="$ssh_port"
+    echo "      вход: ssh $TL_USER@$ip:$admin_port"
 
     # --- dry-run: показать план и остановиться ---
     if [ "$DRY_RUN" = "1" ]; then
-        echo "[dry]     $ip — был бы вход по $via ($TL_USER@$ip:$admin_port), ключ → $local_target"
+        echo "[dry]     $ip — был бы вход по ssh ($TL_USER@$ip:$admin_port), ключ → $local_target"
         OK=$((OK+1))
         continue
     fi
 
-    if ! ensure_client_deps "$via"; then
-        echo "[$name] пропуск: нет expect/$via или TL_PASS"
+    if ! ensure_client_deps; then
+        echo "[$name] пропуск: нет expect/ssh или TL_PASS"
         FAIL=$((FAIL+1))
         continue
     fi
     ensure_utf8_locale
-    deploy_one "$ip" "$admin_port" "$local_target" "$rights_only" "$via" "$ssh_port"
-    rc=$?
+    npass="${NEWUSER_PASS:-mk-$(date +%s)-$RANDOM}"
+    deploy_one "$ip" "$admin_port" "$local_target" "$rights_only" "$npass" 2>&1 | scrub_secrets "$npass" | tee -a "$LOG"
+    rc=${PIPESTATUS[0]}
     echo "      rc=$rc"
     if [ "$rc" -eq 0 ]; then
         if [ "$rights_only" = "1" ]; then
-            # главный критерий: группа/права пользователя теперь совпадают с TARGET_GROUP
+            # главный критерий: реальные политики группы пользователя теперь достаточны
             if [ "$SSH_VERIFY" = "1" ] && [ "$SSH_PROBE" = "1" ]; then
-                if g=$(ssh_user_group "$ip" "$ssh_port" "$local_target") && [ "$g" = "$TARGET_GROUP" ]; then
-                    echo "      [OK] подтверждено по SSH: группа '$local_target' = '$TARGET_GROUP'"
+                g=$(ssh_user_group "$ip" "$ssh_port" "$local_target" 2>/dev/null) || g=""
+                pol=$(ssh_group_policy_of_user "$ip" "$ssh_port" "$local_target" 2>/dev/null) || pol=""
+                if [ -n "$g" ] && { pol_has_all "$pol" "$(need_policies)" || [ "$g" = "$TARGET_GROUP" ]; }; then
+                    echo "      [OK] подтверждено по SSH: права '$local_target' достаточны (группа '$g', политики: ${pol:-<целевая группа>})"
                     OK=$((OK+1))
                 else
-                    echo "      [!!] группа после исправления не подтвердилась ('$g') — нужна ручная проверка"
+                    echo "      [!!] права после исправления не подтвердились по SSH (группа '${g:-?}', политики: ${pol:-не читаются}) — нужна ручная проверка"
                     FAIL=$((FAIL+1))
                 fi
             else
@@ -765,7 +772,7 @@ while IFS=':' read -r name ip port user desc; do
             fi
         elif [ "$SSH_VERIFY" = "1" ] && [ "$SSH_PROBE" = "1" ]; then
             # главный критерий успеха установки: ключ РЕАЛЬНО заходит по SSH.
-            # (telnet-вывод может скрывать ошибки — доверяем только проверке входа)
+            # (вывод expect-сессии может скрывать ошибки — доверяем только проверке входа)
             if ssh_key_works "$ip" "$ssh_port" "$local_target"; then
                 echo "      [OK] подтверждено: ssh $local_target@$ip — ключ работает"
                 OK=$((OK+1))

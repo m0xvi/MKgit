@@ -3,10 +3,10 @@
 # MikroTik Key/Rights Deploy Worker (для бота и запуска из консоли)
 # =============================================================================
 # Назначение:
-#   - запуск deploy_key.sh (telnet/ssh) по устройствам из devices.conf —
+#   - запуск deploy_key.sh (SSH) по устройствам из devices.conf —
 #     установка SSH-ключа MikroGit целевому пользователю + проверка и доводка
 #     прав до МИНИМАЛЬНОЙ группы (DEPLOY_TARGET_GROUP, по умолчанию mikrogit,
-#     политики ssh,read,write,test,reboot,policy) — прямо из бота или консоли:
+#     политики ssh,read,write,test,reboot,policy,ftp) — прямо из бота или консоли:
 #        bash tg/mk_deploy.sh all
 #        bash tg/mk_deploy.sh <device>
 #        bash tg/mk_deploy.sh status
@@ -32,9 +32,9 @@ DEPLOY_SCRIPT="${DEPLOY_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/de
 DEPLOY_KEY_FILE="${DEPLOY_KEY_FILE:-${SSH_KEY:-$HOME/.ssh/mk_key}.pub}"
 DEPLOY_KEY_PRIV="${DEPLOY_KEY_PRIV:-${SSH_KEY:-$HOME/.ssh/mk_key}}"
 
-# Администраторский вход на роутер (telnet/ssh) для установки ключа и выдачи прав
+# Администраторский вход на роутер по SSH (для установки ключа и выдачи прав).
+# Порт SSH берётся из devices.conf (поле 3) для каждого устройства.
 DEPLOY_TL_USER="${DEPLOY_TL_USER:-admin}"
-DEPLOY_TL_PORT="${DEPLOY_TL_PORT:-23}"
 DEPLOY_TL_PASS="${DEPLOY_TL_PASS:-}"
 
 # Целевой пользователь (пусто = пользователь из 4-го поля devices.conf)
@@ -46,15 +46,13 @@ DEPLOY_TARGET_GROUP="${DEPLOY_TARGET_GROUP:-mikrogit}"
 # Политики группы (применяются при СОЗДАНИИ группы). Минимум для задач бота
 # (бэкап + проверка/установка обновлений RouterOS через роутер): ssh,read,
 # write,test,reboot,policy.
-DEPLOY_TARGET_POLICY="${DEPLOY_TARGET_POLICY:-ssh,read,write,test,reboot,policy}"
+DEPLOY_TARGET_POLICY="${DEPLOY_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp}"
 # Пароль для создаваемого пользователя (пусто = случайный, будет в логе)
 DEPLOY_NEWUSER_PASS="${DEPLOY_NEWUSER_PASS:-}"
 
-# Транспорт входа администратора: auto | telnet | ssh (auto: telnet, если открыт,
-# иначе ssh — для устройств с отключённым telnet)
-DEPLOY_LOGIN_VIA="${DEPLOY_LOGIN_VIA:-auto}"
 # 1 = сначала SSH-предпроверка ключом (уже работает — права проверяем, ключ не
-# ставим); 0 = всегда полный прогон
+# ставим); 0 = всегда полный прогон. Вход администратора — только по SSH
+# (telnet из кода/конфигов удалён полностью).
 DEPLOY_SSH_PROBE="${DEPLOY_SSH_PROBE:-1}"
 # 1 = после развёртывания повторно подтверждать вход ключом / права по SSH
 DEPLOY_SSH_VERIFY="${DEPLOY_SSH_VERIFY:-1}"
@@ -66,6 +64,16 @@ DEPLOY_ONE_TIMEOUT="${DEPLOY_ONE_TIMEOUT:-600}"
 dep_state_dir() {
     echo "${DEPLOY_STATE_DIR:-$(dirname "${LOG_FILE:-/tmp/mk_deploy.log}")/deploy_state}"
 }
+
+# -----------------------------------------------------------------------------
+# Флаг остановки фонового деплоя (ставится кнопкой «⏹ Остановить» в боте).
+# Воркер проверяет его МЕЖДУ устройствами и завершается аккуратно — не рвёт
+# текущую SSH-сессию на середине операции, а просто не начинает следующее.
+# -----------------------------------------------------------------------------
+dep_cancel_file()      { echo "$(dep_state_dir)/stop_deploy"; }
+dep_cancel_set()       { : > "$(dep_cancel_file)"; }
+dep_cancel_clear()     { rm -f "$(dep_cancel_file)"; }
+dep_cancel_requested() { [ -f "$(dep_cancel_file)" ]; }
 
 # -----------------------------------------------------------------------------
 # Служебное: лог и отправка в Telegram (tg_send_message должен быть загружен)
@@ -80,6 +88,18 @@ dep_send() {
     # Иначе — пишем в лог (режим CLI/тест).
     if declare -f tg_send_message > /dev/null 2>&1        && [ -n "${TELEGRAM_CHAT_ID:-}" ] && [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
         tg_send_message "$TELEGRAM_CHAT_ID" "$1"
+    else
+        dep_log "(tg_send_message недоступен/нет конфига) $1"
+    fi
+}
+
+# Как dep_send, но с кнопкой «⏹ Остановить деплой» — вешается на сообщения,
+# которые воркер шлёт, ПОКА идёт обработка (самое свежее сообщение всегда
+# содержит кнопку отмены).
+dep_send_kb() {
+    local kb='[[{"text":"⏹ Остановить деплой","callback_data":"deploy_stop"}]]'
+    if declare -f tg_send_keyboard > /dev/null 2>&1        && [ -n "${TELEGRAM_CHAT_ID:-}" ] && [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+        tg_send_keyboard "$TELEGRAM_CHAT_ID" "$1" "$kb"
     else
         dep_log "(tg_send_message недоступен/нет конфига) $1"
     fi
@@ -186,8 +206,6 @@ dep_run_one() {
         # Обязательные/часто используемые передаём всегда (пустой TARGET_GROUP =
         # «права не менять» — это тоже осмысленное значение).
         export TL_USER="$DEPLOY_TL_USER"
-        export TL_PORT="$DEPLOY_TL_PORT"
-        export LOGIN_VIA="$DEPLOY_LOGIN_VIA"
         export SSH_PROBE="$DEPLOY_SSH_PROBE"
         export SSH_VERIFY="$DEPLOY_SSH_VERIFY"
         export TARGET_GROUP="$DEPLOY_TARGET_GROUP"
@@ -233,6 +251,11 @@ dep_result_message() {
 # -----------------------------------------------------------------------------
 dep_worker_device() {
     local name="$1"
+    dep_cancel_clear
+    if dep_cancel_requested; then
+        dep_send "⏹ Деплой остановлен пользователем (устройство <b>$name</b> не обрабатывалось)."
+        return 130
+    fi
     # Устройство должно существовать в devices.conf
     local cfg; cfg=$(dep_cfg_file)
     if [ ! -f "$cfg" ] || ! grep -q "^$name:" "$cfg"; then
@@ -243,10 +266,16 @@ dep_worker_device() {
         dep_send "⏳ <b>$name</b>: сейчас идёт операция обновления — пропускаю деплой. Повторите позже."
         return 2
     fi
-    dep_send "🔑 <b>$name</b>: запускаю установку ключа / проверку прав…"
+    dep_send_kb "🔑 <b>$name</b>: запускаю установку ключа / проверку прав…"
     dep_run_one "$name"
     local rc=$?
     dep_send "$(dep_result_message "$name" "$rc" "$(dep_state_dir)/run_$name.log")"
+    # если во время обработки устройства пришёл запрос «Остановить» — сообщаем
+    # об этом кодом 130 (флаг НЕ снимаем: его обработает цикл dep_worker_all)
+    if dep_cancel_requested; then
+        dep_send "⏹ <b>$name</b>: обработка завершена, останавливаюсь по запросу."
+        return 130
+    fi
     return "$rc"
 }
 
@@ -259,10 +288,13 @@ dep_worker_all() {
         dep_send "⏳ Деплой уже выполняется в фоне. Дождитесь завершения."
         return 1
     fi
+    # свежий запуск: снимаем возможный старый флаг остановки
+    dep_cancel_clear
     local cfg names=() name
     cfg=$(dep_cfg_file)
     if [ ! -f "$cfg" ]; then
         dep_send "❌ Нет файла devices.conf ($cfg)."
+        dep_cancel_clear
         dep_lock_release
         return 1
     fi
@@ -272,16 +304,32 @@ dep_worker_all() {
     local total=${#names[@]}
     if [ "$total" = 0 ]; then
         dep_send "❌ Нет устройств в devices.conf."
+        dep_cancel_clear
         dep_lock_release
         return 1
     fi
-    dep_send "🔑 <b>Деплой ключа и прав на все устройства</b> ($total).\nРаботаю строго по одному; по каждому — отдельное сообщение. Это может занять время (по ~0,5–2 мин на устройство, если нужен telnet/ssh вход)."
+    dep_send_kb "🔑 <b>Деплой ключа и прав на все устройства</b> ($total).\nРаботаю строго по одному; по каждому — отдельное сообщение. Это может занять время (по ~0,5–2 мин на устройство).\n\n⏹ На свежих сообщениях есть кнопка «Остановить деплой» — остановка после текущего устройства."
 
-    local n=0 ok=0 err=0 skp=0 rc
+    local n=0 ok=0 err=0 skp=0 rc stopped=0
     for name in "${names[@]}"; do
+        # между устройствами проверяем флаг остановки (ставится кнопкой в боте)
+        if dep_cancel_requested; then
+            dep_cancel_clear
+            stopped=1
+            dep_send "⏹ <b>Деплой остановлен пользователем</b> (обработано $n из $total)."
+            break
+        fi
         n=$((n + 1))
         dep_worker_device "$name"
         rc=$?
+        # пользователь мог нажать «Остановить», пока шло текущее устройство:
+        # завершаем цикл (текущее устройство доведено до конца — это безопасно;
+        # само устройство уже сообщило «останаливаюсь по запросу» при rc=130)
+        if dep_cancel_requested; then
+            dep_cancel_clear
+            stopped=1
+            break
+        fi
         case "$rc" in
             0)
                 if grep -aq "Уже настроено (пропущено): *1" "$(dep_state_dir)/run_$name.log"; then
@@ -293,7 +341,12 @@ dep_worker_all() {
         esac
         dep_send "✅ [$n/$total] <b>$name</b>: обработан. Перехожу к следующему…"
     done
-    dep_send "📊 <b>Деплой завершён</b> ($n/$total): успешно ✅ $ok • уже настроено ⏭️ $skp • ошибки ❌ $err"
+    if [ "$stopped" = "1" ]; then
+        dep_send "📊 <b>Деплой прерван пользователем</b> (остановлен после $n/$total): успешно ✅ $ok • уже настроено ⏭️ $skp • ошибки ❌ $err"
+    else
+        dep_send "📊 <b>Деплой завершён</b> ($n/$total): успешно ✅ $ok • уже настроено ⏭️ $skp • ошибки ❌ $err"
+    fi
+    dep_cancel_clear
     dep_lock_release
     return "$err"
 }
@@ -309,8 +362,14 @@ dep_print_last_status() {
         dep_send "📭 Деплой ещё не запускался из бота. Нажмите «Развернуть на ВСЕХ» или выберите устройство."
         return 1
     fi
-    local body
-    body=$(dep_grep_good < "$log" | dep_html | tail -n 25)
+    local body raw
+    # Секреты (пароли, ключи, токены) вычищаем ДО отправки в Telegram.
+    if declare -f log_sanitize > /dev/null 2>&1; then
+        raw=$(log_sanitize < "$log")
+    else
+        raw=$(cat "$log")
+    fi
+    body=$(printf '%s' "$raw" | dep_grep_good | dep_html | tail -n 25)
     [ -z "$body" ] && body="(пусто)"
     dep_send "📜 <b>Последний лог деплоя</b> (<code>$(basename "$log")</code>)\n<code>$body</code>"
     return 0

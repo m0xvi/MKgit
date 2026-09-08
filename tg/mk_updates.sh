@@ -74,8 +74,10 @@ rup_state_dir() {
     echo "${UPDATE_STATE_DIR:-$(dirname "${LOG_FILE:-/tmp/mk_updates.log}")/update_state}"
 }
 
-# Автопроверка по расписанию (использует бот в run_bot)
-UPDATE_AUTO_CHECK="${UPDATE_AUTO_CHECK:-1}"
+# Автопроверка по расписанию (использует бот в run_bot).
+# 0 = выкл (по умолчанию): подключения к роутерам только по кнопке/команде.
+# 1 = вкл: бот сам запускает «check all» не чаще раза в UPDATE_AUTO_INTERVAL_HOURS.
+UPDATE_AUTO_CHECK="${UPDATE_AUTO_CHECK:-0}"
 UPDATE_AUTO_INTERVAL_HOURS="${UPDATE_AUTO_INTERVAL_HOURS:-24}"
 
 # SSH опции (по образцу остальных скриптов репозитория)
@@ -102,6 +104,26 @@ rup_send() {
 rup_send_keyboard() {
     if declare -f tg_send_keyboard > /dev/null 2>&1; then
         tg_send_keyboard "${TELEGRAM_CHAT_ID:-}" "$1" "$2"
+    else
+        rup_log "(tg_send_keyboard недоступен) $1"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Флаг остановки фоновых операций обновлений (кнопка «⏹ Остановить» в боте).
+# Воркер проверяет МЕЖДУ устройствами и завершается аккуратно.
+# -----------------------------------------------------------------------------
+rup_stop_file()      { echo "$(rup_state_dir)/stop_updates"; }
+rup_stop_set()       { : > "$(rup_stop_file)"; }
+rup_stop_clear()     { rm -f "$(rup_stop_file)"; }
+rup_stop_requested() { [ -f "$(rup_stop_file)" ]; }
+
+# Кнопка «⏹ Остановить операции обновлений» для сообщений воркера
+RUP_STOP_KB='[[{"text":"⏹ Остановить","callback_data":"upd_stop"}]]'
+
+rup_send_stop() {
+    if declare -f tg_send_keyboard > /dev/null 2>&1; then
+        tg_send_keyboard "${TELEGRAM_CHAT_ID:-}" "$1" "$RUP_STOP_KB"
     else
         rup_log "(tg_send_keyboard недоступен) $1"
     fi
@@ -439,8 +461,8 @@ rup_worker_check() {
     fi
 
     local total=${#names[@]}
-    rup_send "🔎 <b>Проверка обновлений RouterOS…</b> (устройств: $total)
-Результат по каждому устройству придёт отдельным сообщением по мере проверки."
+    rup_send_stop "🔎 <b>Проверка обновлений RouterOS…</b> (устройств: $total)\nРезультат по каждому устройству придёт отдельным сообщением по мере проверки.\n\n⏹ Кнопка «Остановить» на свежих сообщениях — прерывание после текущего устройства."
+    rup_stop_clear
 
     local all_tsv="" n=0
     local upd_buttons="["
@@ -448,9 +470,16 @@ rup_worker_check() {
     local have_any=0
 
     for name in "${names[@]}"; do
+        # проверка запроса остановки между устройствами
+        if rup_stop_requested; then
+            rup_stop_clear
+            rup_send "⏹ <b>Проверка остановлена пользователем</b> (проверено $((n-1)) из $total)."
+            rup_lock_release "check"
+            return 130
+        fi
         n=$((n+1))
         # Сразу показываем прогресс, чтобы не казалось, что бот завис
-        rup_send "⏳ [$n/$total] <b>$name</b>: проверяю…"
+        rup_send_stop "⏳ [$n/$total] <b>$name</b>: проверяю…"
         tsv=$(rup_check_device "$name")
         IFS=$'\t' read -r _ status _ _ _ _ _ <<< "$tsv"
         all_tsv+="$tsv"$'\n'
@@ -821,6 +850,7 @@ rup_worker_update_all() {
         rup_busy_message "обновление всех устройств"
         return 1
     fi
+    rup_stop_clear
     local -a names=()
     local name
     while IFS= read -r name; do
@@ -832,11 +862,16 @@ rup_worker_update_all() {
         rup_lock_release "update_all"
         return 1
     fi
-    rup_send "🔄 <b>Поочерёдное обновление всех устройств</b> ($total).\nПорядок: ${UPDATE_ALL_PRIORITY:-AP SW GW} → остальные.\nКаждое устройство ждём и проверяем — к следующему переходим только после завершения.\nЭто может занять длительное время (по несколько минут на устройство с обновлением)."
-    local n=0 ok=0 err=0 skp=0 tsv status det
+    rup_send_stop "🔄 <b>Поочерёдное обновление всех устройств</b> ($total).\nПорядок: ${UPDATE_ALL_PRIORITY:-AP SW GW} → остальные.\nКаждое устройство ждём и проверяем — к следующему переходим только после завершения.\nЭто может занять длительное время (по несколько минут на устройство с обновлением).\n\n⏹ Кнопка «Остановить» на свежих сообщениях — прерывание после текущего устройства."
+    local n=0 ok=0 err=0 skp=0 stopped=0 tsv status det
     for name in "${names[@]}"; do
+        if rup_stop_requested; then
+            rup_stop_clear
+            stopped=1
+            break
+        fi
         n=$((n+1))
-        rup_send "▶️ [$n/$total] <b>$name</b>: начинаю (проверка состояния)…"
+        rup_send_stop "▶️ [$n/$total] <b>$name</b>: начинаю (проверка состояния)…"
         tsv=$(rup_check_device "$name")
         IFS=$'\t' read -r _ status _ _ _ _ det <<< "$tsv"
         case "$status" in
@@ -854,7 +889,12 @@ rup_worker_update_all() {
         esac
         rup_send "✅ [$n/$total] <b>$name</b>: обработан. Перехожу к следующему…"
     done
-    rup_send "📊 <b>Обновление всех завершено</b> ($n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err"
+    if [ "$stopped" = "1" ]; then
+        rup_send "🛑 <b>Обновление всех остановлено пользователем</b> (после $n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err"
+    else
+        rup_send "📊 <b>Обновление всех завершено</b> ($n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err"
+    fi
+    rup_stop_clear
     rup_lock_release "update_all"
     return "$err"
 }
