@@ -247,6 +247,8 @@ rup_parse_field() {
     # Вызов в двух вариантах:
     #   А) rup_parse_field "<текст вывода>" "имя_поля"
     #   Б) echo "<текст>" | rup_parse_field "имя_поля"
+    # Берём ПОСЛЕДНЕЕ совпадение: check-for-updates сначала пишет
+    # "status: finding out latest version...", затем итоговый статус.
     local text f
     if [ "$#" -ge 2 ]; then
         text="$1"; f="$2"
@@ -256,8 +258,11 @@ rup_parse_field() {
     # Ищет строку вида "   latest-version: 7.18.1"
     awk -v f="$f" '
         tolower($0) ~ "^[ \t]*" f "[ \t]*:" {
-            sub(/^[^:]*:[ \t]*/, ""); sub(/[ \t\r]*$/, ""); print; exit
-        }' <<< "$text"
+            val=$0
+            sub(/^[^:]*:[ \t]*/, "", val); sub(/[ \t\r]*$/, "", val)
+        }
+        END { if (val != "") print val }
+        ' <<< "$text"
 }
 
 rup_version_major() {
@@ -997,4 +1002,5 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     rup_main "$@"
     exit $?
 fi
+
 
