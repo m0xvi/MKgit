@@ -47,7 +47,14 @@ tg_api_call() {
                     -H "Content-Type: application/json" -d "$data" \
                     -o "$tmp_body" -w "%{http_code}" "$url" > "$tmp_code" 2>/dev/null ;;
             UPLOAD)
-                curl $curl_opts -X POST -F "$data" \
+                # data: по одному multipart-полю на строку (chat_id=… / document=@path)
+                # Нельзя склеивать в одно -F "a=b&document=@file" — curl не прикрепит файл.
+                local -a _ff=()
+                local _line
+                while IFS= read -r _line; do
+                    [ -n "$_line" ] && _ff+=(-F "$_line")
+                done <<< "$data"
+                curl $curl_opts -X POST "${_ff[@]}" \
                     -o "$tmp_body" -w "%{http_code}" "$url" > "$tmp_code" 2>/dev/null ;;
             *) tg_api_log "ERROR" "Unknown method: $method"; return 1 ;;
         esac
@@ -102,8 +109,12 @@ tg_send_keyboard() {
 tg_send_document() {
     local chat_id="${1:-$TELEGRAM_CHAT_ID}" fp="${2:-}" caption="${3:-}"
     [ ! -f "$fp" ] && { tg_api_log "ERROR" "File not found: $fp"; return 1; }
-    local fd="chat_id=$chat_id&document=@$fp"
-    [ -n "$caption" ] && fd+="&caption=$caption"
+    local bn fd
+    bn=$(basename "$fp")
+    fd=$(printf 'chat_id=%s\ndocument=@%s;filename=%s;type=application/octet-stream' "$chat_id" "$fp" "$bn")
+    if [ -n "$caption" ]; then
+        fd+=$(printf '\ncaption=%s\nparse_mode=HTML' "$caption")
+    fi
     tg_api_call "UPLOAD" "sendDocument" "$fd" > /dev/null
 }
 
