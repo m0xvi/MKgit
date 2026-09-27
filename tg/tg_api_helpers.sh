@@ -108,7 +108,9 @@ tg_send_document() {
 }
 
 tg_get_updates() {
-    tg_api_call "GET" "getUpdates?offset=${1:-0}&timeout=${2:-60}"
+    local off="${1:-0}" tmo="${2:-60}"
+    tg_api_call "POST" "getUpdates" \
+        "{\"offset\":${off},\"timeout\":${tmo},\"allowed_updates\":[\"message\",\"callback_query\"]}"
 }
 
 # --- Callback answer (убирает "часики" на кнопке) ---
