@@ -68,51 +68,35 @@ error() { echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1"; echo "[
 # =============================================================================
 # Две одновременно работающие копии бота делят long-polling getUpdates и
 # «съедают»/дублируют сообщения (бот молчит, отвечает с ошибками, сбрасывает
-# шаги добавления устройства, а также получают от Telegram HTTP 409 «Conflict:
-# terminated by other getUpdates request»). Главный симптом для пользователя —
-# inline-кнопки «не нажимаются»: callback_query уходят конкуренту, который
-# в этот момент кратковременно получит наш offset-«замок».
-#
-# Ниже — АТОМАРНЫЙ lock через flock (если есть) ИЛИ mkdir-lock (всегда).
-# В обоих случаях вторая копия при старте мгновенно завершается с ошибкой,
-# а lock автоматически освобождается при выходе процесса (ядро снимает
-# flock при закрытии fd; для mkdir — отдельный trap по EXIT, проверяющий
-# владельца каталога через $$).
+# шаги добавления устройства). Ниже — АТОМАРНАЯ блокировка через flock:
+# вторая копия при старте видит занятый lock и сразу завершается.
 BOT_LOCK_FILE="$(dirname "$LOG_FILE")/mk_tg_bot.lock"
-BOT_LOCK_DIR="$(dirname "$LOG_FILE")/mk_tg_bot.lockdir"
 
 ensure_single_instance() {
     mkdir -p "$(dirname "$BOT_LOCK_FILE")" 2>/dev/null || true
     if command -v flock > /dev/null 2>&1; then
-        # Атомарно: fd 9 держим открытым на время жизни процесса;
-        # при выходе процесса ядро само снимает блокировку (не требуется
-        # trap). Дополнительно пишем pid внутрь lock-файла — удобнее
-        # диагностировать, кто держит lock (`cat .lock`).
+        # Атомарно: fd 9 держим открытым на время жизни процесса,
+        # при выходе процесса ядро само снимает блокировку.
         exec 9> "$BOT_LOCK_FILE"
         if ! flock -n 9; then
-            local holder_pid
-            holder_pid=$(cat "$BOT_LOCK_FILE" 2>/dev/null || echo "?")
-            error "Бот уже запущен (lock занят: $BOT_LOCK_FILE, holder pid=${holder_pid}). Остановите старый процесс и запустите бота один раз (systemd ИЛИ start_bot_with_ssh.sh)."
+            error "Бот уже запущен (lock занят: $BOT_LOCK_FILE). Остановите старый процесс и запустите бота один раз (systemd ИЛИ start_bot_with_ssh.sh)."
             exit 1
         fi
         echo "$$" >&9
     else
-        # Fallback без flock: mkdir-lock — атомарен на уровне VFS Linux/BSD.
-        # mkdir(2) возвращает EEXIST, если каталог уже создан; никаких
-        # pid-файлов, никаких гонок.
-        if mkdir "$BOT_LOCK_DIR" 2>/dev/null; then
-            echo "$$" > "$BOT_LOCK_DIR/pid"
-            trap 'rm -rf "$BOT_LOCK_DIR"' EXIT INT TERM
-        else
-            local holder_pid
-            holder_pid=$(cat "$BOT_LOCK_DIR/pid" 2>/dev/null || echo "?")
-            local holder_alive="(stale?)"
-            if [ -n "$holder_pid" ] && [ "$holder_pid" != "?" ] && kill -0 "$holder_pid" 2>/dev/null; then
-                holder_alive="alive"
+        # Fallback без flock: проверка pid-файла
+        BOT_PID_FILE="$BOT_LOCK_FILE.pid"
+        if [ -f "$BOT_PID_FILE" ]; then
+            local opid
+            opid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
+            if [ -n "$opid" ] && kill -0 "$opid" 2>/dev/null; then
+                error "Бот уже запущен (pid=$opid). Запустите только один экземпляр."
+                exit 1
             fi
-            error "Бот уже запущен (lockdir: $BOT_LOCK_DIR, holder pid=${holder_pid} ${holder_alive}). Остановите старый процесс и запустите бота один раз (systemd ИЛИ start_bot_with_ssh.sh)."
-            exit 1
+            rm -f "$BOT_PID_FILE"
         fi
+        echo "$$" > "$BOT_PID_FILE"
+        trap 'rm -f "$BOT_PID_FILE"' EXIT
     fi
     log "Single-instance lock acquired (pid=$$)"
 }
@@ -1085,25 +1069,15 @@ process_update() {
     fi
 
     # Диагностика каждого апдейта: тип (text/callback/other), чтобы по логу
-    # было видно, какие сообщения реально доходят до бота. Дополнительно
-    # логируем callback_query.id (cbqid) — без этого в логе не отличить
-    # «callback с пустым data» (например, при устаревшей/битой inline-кнопке)
-    # от «до бота вообще не дошли нажатия» — критично для диагностики
-    # дублей ботов и потери inline-меню.
-    local upd_type="text" cb_id_diag=""
-    cb_id_diag=$(echo "$update" | jq -r '.callback_query.id // ""' 2>/dev/null)
+    # было видно, какие сообщения реально доходят до бота.
+    local upd_type="text"
     if [ -n "$callback_data" ]; then upd_type="callback"; fi
     if echo "$update" | jq -e '.message.photo or .message.sticker or .message.document or .message.voice or .message.video' > /dev/null 2>&1; then
         upd_type="non-text-media"
     elif [ -n "$message_text" ]; then :;
-    elif [ -n "$cb_id_diag" ] && [ -z "$callback_data" ]; then upd_type="callback-empty"
     elif [ -z "$callback_data" ]; then upd_type="empty"
     fi
-    if [ -n "$cb_id_diag" ]; then
-        log "Update - chat=$chat_id type=$upd_type text='$message_text' cb='$callback_data' cbqid='$cb_id_diag'"
-    else
-        log "Update - chat=$chat_id type=$upd_type text='$message_text' cb='$callback_data'"
-    fi
+    log "Update - chat=$chat_id type=$upd_type text='$message_text' cb='$callback_data'"
 
     # --- Interactive mode (adding device) ---
     local user_state=$(get_user_state "$chat_id")
@@ -1396,38 +1370,16 @@ run_bot() {
     # Исключаем запуск второй копии бота
     ensure_single_instance
 
-    # Замечание: tg_test_connection уже выполнен в start_bot_with_ssh.sh перед
-    # запуском этого скрипта (либо, если бот запущен напрямую — при первом
-    # импорте tg_api_helpers.sh). Не дублируем его здесь: повторный прогон
-    # увеличивает шум в логе и бесполезен — прокси/сеть уже проверены.
-    # Если бот стартует БЕЗ start_bot_with_ssh.sh (например, ручной запуск
-    # из crontab/systemd), короткий smoke-тест всё же выполняется:
-    if [ "${MK_BOT_SKIP_TEST:-0}" != "1" ]; then
-        if ! tg_test_connection > /dev/null 2>&1; then
-            error "Cannot reach Telegram API. Check proxy settings. Exiting."
-            exit 1
-        fi
+    # Test connection first
+    if ! tg_test_connection; then
+        error "Cannot reach Telegram API. Check proxy settings. Exiting."
+        exit 1
     fi
 
     tg_send_message "$TELEGRAM_CHAT_ID" "🤖 <b>MikroTik Backup Bot started!</b>"
     tg_send_message "$TELEGRAM_CHAT_ID" "Send /menu to begin"
 
-    # --- Persisted offset: переживает рестарт, чтобы Telegram не
-    # пере-доставлял старые callback'и после перезапуска (а старый бот
-    # ещё не снял lock — это приводит к двойным getUpdates и 409).
-    # Файл лежит рядом с lock-файлом и имеет одинаковый путь для всех
-    # копий, запущенных с одним и тем же LOG_FILE.
-    local OFFSET_FILE="$(dirname "$LOG_FILE")/.tg_offset"
     local offset=0
-    if [ -f "$OFFSET_FILE" ]; then
-        local saved_offset
-        saved_offset=$(cat "$OFFSET_FILE" 2>/dev/null || true)
-        if [[ "$saved_offset" =~ ^[0-9]+$ ]]; then
-            offset="$saved_offset"
-            log "Resuming from persisted offset=$offset"
-        fi
-    fi
-
     while true; do
         local response=$(tg_get_updates "$offset" 60)
 
@@ -1437,20 +1389,18 @@ run_bot() {
             continue
         fi
 
-        local updates=$(echo "$response" | jq -r '.result[]? | @base64' 2>/dev/null)
-
-        if [ -n "$updates" ]; then
-            for update in $updates; do
-                [ -z "$update" ] && continue
-                local decoded_update=$(echo "$update" | base64 --decode 2>/dev/null)
-                [ -z "$decoded_update" ] && continue
+        # Не через @base64 + for-in: длинный callback_query ломается на пробелах/переносах,
+        # апдейт тихо пропускается — /menu живёт, кнопки нет.
+        local n_upd
+        n_upd=$(echo "$response" | jq -r '.result | length' 2>/dev/null || echo 0)
+        if [ "${n_upd:-0}" -gt 0 ] 2>/dev/null; then
+            local i decoded_update uid
+            for i in $(seq 0 $((n_upd - 1))); do
+                decoded_update=$(echo "$response" | jq -c ".result[$i]" 2>/dev/null)
+                [ -z "$decoded_update" ] || [ "$decoded_update" = "null" ] && continue
+                uid=$(echo "$decoded_update" | jq -r '.update_id' 2>/dev/null)
                 process_update "$decoded_update"
-                local new_offset
-                new_offset=$(echo "$decoded_update" | jq -r '.update_id' 2>/dev/null)
-                if [[ "$new_offset" =~ ^[0-9]+$ ]]; then
-                    offset=$(( new_offset + 1 ))
-                    echo "$offset" > "$OFFSET_FILE" 2>/dev/null || true
-                fi
+                [ -n "$uid" ] && [ "$uid" != "null" ] && offset=$((uid + 1))
             done
         fi
 
