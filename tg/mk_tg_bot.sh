@@ -722,7 +722,9 @@ rup_spawn() {
 
 # Идёт ли какая-либо операция обновлений (для кнопки «Остановить»)
 rup_any_busy() {
-    local d="$(rup_state_dir)" lock
+    rup_reap_stale_locks
+    local d="$(rup_state_dir)"
+    local lock
     for lock in lock_check lock_update_all; do
         [ -d "$d/$lock" ] && return 0
     done
@@ -737,6 +739,8 @@ show_updates_menu() {
         [{"text": "🔎 Проверить сейчас (все)", "callback_data": "upd_check_all"}],
         [{"text": "📋 Последний статус", "callback_data": "upd_status"}],
         [{"text": "🔩 RouterBOOT firmware", "callback_data": "upd_rb_menu"}],
+        [{"text": "ℹ️ Фон / зависшие задачи", "callback_data": "upd_jobs"}],
+        [{"text": "🛑 Сбросить фон", "callback_data": "upd_jobs_kill"}],
         [{"text": "🔙 Back", "callback_data": "menu"}]
     ]'
     tg_send_keyboard "$TELEGRAM_CHAT_ID" "⬆️ <b>Обновления RouterOS</b>\n\n• Проверка идёт через сам роутер (<code>/system package update</code>)\n• Перед установкой создаётся резервная копия (MikroGit)\n• Установка — только после вашего подтверждения и требует перезагрузки устройства\n• Обновление — в рамках текущей ветки (6.x или 7.x)\n• RouterBOOT firmware обновляется автоматически сразу после обновления RouterOS\n  (отдельно — кнопкой «RouterBOOT firmware»)\n\nВыберите действие:" "$keyboard"
@@ -864,8 +868,9 @@ ask_update_all() {
 
 confirm_update_all() {
     log "Confirm update ALL"
+    rup_reap_stale_locks
     if [ -d "$(rup_state_dir)/lock_update_all" ]; then
-        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Обновление всех уже запущено. Дождитесь завершения."
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Обновление всех уже запущено.\\nСброс: 🛑 Сбросить фон."
         return 1
     fi
     tg_send_message "$TELEGRAM_CHAT_ID" "🔄 <b>Запускаю поочерёдное обновление всех устройств…</b>\nХод выполнения буду присылать сюда."
@@ -955,8 +960,9 @@ ask_upd_pick_go() {
 confirm_upd_pick() {
     local f="$(rup_pick_file)" listf="$(rup_state_dir)/apply_list.txt"
     [ -s "$f" ] || { tg_send_message "$TELEGRAM_CHAT_ID" "❌ Список пуст."; return 1; }
+    rup_reap_stale_locks
     if [ -d "$(rup_state_dir)/lock_update_all" ]; then
-        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Уже идёт пакетное обновление."
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Уже идёт пакетное обновление.\\nСброс: меню обновлений → 🛑 Сбросить фон."
         return 1
     fi
     cp "$f" "$listf"
@@ -1303,14 +1309,27 @@ process_update() {
                 tg_clear_keyboard "$chat_id" "$cb_msg_id"
                 cancel_update_all ;;
             upd_stop)
-                # Кнопка «⏹ Остановить» на сообщениях воркера обновлений
                 tg_clear_keyboard "$chat_id" "$cb_msg_id"
                 if rup_any_busy; then
                     rup_stop_set
-                    tg_send_message "$chat_id" "⏹ Останавливаю операции обновлений: завершу текущее устройство и остановлюсь."
+                    tg_send_message "$chat_id" "⏹ Останавливаю после текущего устройства. Если зависло — 🛑 Сбросить фон."
                 else
-                    tg_send_message "$chat_id" "ℹ️ Активных операций обновлений нет — останавливать нечего."
+                    tg_send_message "$chat_id" "ℹ️ Активных операций нет."
                 fi ;;
+            upd_jobs)
+                local jr
+                jr=$(rup_busy_report) || true
+                tg_send_message "$chat_id" "$jr" ;;
+            upd_jobs_kill)
+                local keyboard='[
+                    [{"text": "🛑 Да, убить фон и снять локи", "callback_data": "upd_jobs_kill_ok"}],
+                    [{"text": "❌ Отмена", "callback_data": "upd_menu"}]
+                ]'
+                tg_send_keyboard "$chat_id" "⚠️ Принудительно остановить фоновые обновления?\\nТекущее устройство может остаться на середине reboot — проверьте его вручную.\\nЖивой бот не трогается." "$keyboard" ;;
+            upd_jobs_kill_ok)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                rup_force_abort
+                tg_send_message "$chat_id" "🛑 Фон сброшен, локи сняты. Можно запускать выбор устройств снова." ;;
 
             # --- Деплой ключей/прав ---
             deploy_menu)
