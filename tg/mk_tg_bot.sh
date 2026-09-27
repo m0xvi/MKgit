@@ -732,6 +732,7 @@ rup_any_busy() {
 
 show_updates_menu() {
     local keyboard='[
+        [{"text": "☑️ Выбрать устройства", "callback_data": "upd_pick"}],
         [{"text": "⬆️ Обновить ВСЕ по очереди (AP→SW→GW)", "callback_data": "upd_all"}],
         [{"text": "🔎 Проверить сейчас (все)", "callback_data": "upd_check_all"}],
         [{"text": "📋 Последний статус", "callback_data": "upd_status"}],
@@ -874,6 +875,94 @@ confirm_update_all() {
 cancel_update_all() {
     log "Update ALL cancelled"
     tg_send_message "$TELEGRAM_CHAT_ID" "❌ Обновление всех отменено."
+}
+
+# --- Выборочное обновление: чекбоксы по devices.conf ---
+rup_pick_file() { echo "$(rup_state_dir)/pick_selected.txt"; }
+
+rup_pick_selected() {
+    [ -f "$(rup_pick_file)" ] || return 1
+    grep -Fxq "$1" "$(rup_pick_file)" 2>/dev/null
+}
+
+rup_pick_toggle() {
+    local n="$1" f="$(rup_pick_file)" tmp
+    rup_ensure_dirs
+    touch "$f"
+    tmp=$(mktemp)
+    if grep -Fxq "$n" "$f" 2>/dev/null; then
+        grep -Fxv "$n" "$f" > "$tmp" || true
+        mv "$tmp" "$f"
+    else
+        echo "$n" >> "$f"
+        rm -f "$tmp"
+    fi
+}
+
+rup_pick_set_all() {
+    local f="$(rup_pick_file)" name
+    rup_ensure_dirs
+    : > "$f"
+    while IFS=':' read -r name _ _ _ _; do
+        [[ $name =~ ^# ]] || [[ -z $name ]] && continue
+        echo "$name" >> "$f"
+    done < "${CONFIG_FILE:-/home/aionis/MikroGit/devices.conf}"
+}
+
+rup_pick_clear() { rup_ensure_dirs; : > "$(rup_pick_file)"; }
+
+show_upd_pick_menu() {
+    rup_ensure_dirs
+    local f="$(rup_pick_file)" tsv="$(rup_state_dir)/last_check.tsv"
+    local keyboard='[' name mark st extra sel=0
+    [ -f "$f" ] || : > "$f"
+    while IFS=':' read -r name _ _ _ _; do
+        [[ $name =~ ^# ]] || [[ -z $name ]] && continue
+        mark="☐"
+        rup_pick_selected "$name" && { mark="☑️"; sel=$((sel+1)); }
+        extra=""
+        if [ -f "$tsv" ]; then
+            st=$(awk -F'\t' -v n="$name" '$1==n{print $2; exit}' "$tsv")
+            case "$st" in
+                UPDATE) extra=" ⬆️" ;;
+                CURRENT) extra=" ✅" ;;
+                ERROR) extra=" ⚠️" ;;
+                BUSY) extra=" ⏳" ;;
+            esac
+        fi
+        keyboard+='[{"text":"'$mark' '$name''$extra'","callback_data":"upd_s_'$name'"}],'
+    done < "${CONFIG_FILE:-/home/aionis/MikroGit/devices.conf}"
+    keyboard+='[{"text":"✅ Все","callback_data":"upd_pick_all"},{"text":"🗑 Сброс","callback_data":"upd_pick_none"}],'
+    keyboard+='[{"text":"🚀 Обновить выбранные ('$sel')","callback_data":"upd_pick_go"}],'
+    keyboard+='[{"text":"🔙 Back","callback_data":"upd_menu"}]'
+    keyboard+=']'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "☑️ <b>Выбор устройств для обновления</b>\\nНажмите имя — включить/выключить.\\n⬆️ есть пакет • ✅ актуально (тогда только RouterBOOT)\\nВыбрано: <b>$sel</b>" "$keyboard"
+}
+
+ask_upd_pick_go() {
+    local f="$(rup_pick_file)" names="" n=0
+    [ -s "$f" ] || { tg_send_message "$TELEGRAM_CHAT_ID" "❌ Ничего не выбрано. Отметьте устройства."; show_upd_pick_menu; return 1; }
+    while IFS= read -r names; do [ -n "$names" ] && n=$((n+1)); done < "$f"
+    local list
+    list=$(tr '\n' ', ' < "$f" | sed 's/, $//')
+    local keyboard='[
+        [{"text": "✅ Обновить выбранные ('$n')", "callback_data": "upd_pick_ok"}],
+        [{"text": "❌ Отмена", "callback_data": "upd_pick"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "⚠️ Обновить <b>$n</b> устройств по очереди?\\n<code>$list</code>\\n\\nБэкап + reboot на тех, где есть RouterOS update." "$keyboard"
+}
+
+confirm_upd_pick() {
+    local f="$(rup_pick_file)" listf="$(rup_state_dir)/apply_list.txt"
+    [ -s "$f" ] || { tg_send_message "$TELEGRAM_CHAT_ID" "❌ Список пуст."; return 1; }
+    if [ -d "$(rup_state_dir)/lock_update_all" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⏳ Уже идёт пакетное обновление."
+        return 1
+    fi
+    cp "$f" "$listf"
+    log "Confirm apply list: $(tr '\n' ' ' < "$listf")"
+    tg_send_message "$TELEGRAM_CHAT_ID" "🔄 Запускаю обновление выбранных устройств…"
+    rup_spawn applylist
 }
 
 # =============================================================================
@@ -1186,6 +1275,24 @@ process_update() {
                     tg_clear_keyboard "$chat_id" "$cb_msg_id"
                     cancel_rb_upgrade "$rbname"
                 fi ;;
+            upd_pick)
+                show_upd_pick_menu ;;
+            upd_s_*)
+                local pn=${callback_data#upd_s_}
+                if [[ "$pn" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                    rup_pick_toggle "$pn"
+                    show_upd_pick_menu
+                fi ;;
+            upd_pick_all)
+                rup_pick_set_all; show_upd_pick_menu ;;
+            upd_pick_none)
+                rup_pick_clear; show_upd_pick_menu ;;
+            upd_pick_go)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                ask_upd_pick_go ;;
+            upd_pick_ok)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                confirm_upd_pick ;;
             upd_all)
                 tg_clear_keyboard "$chat_id" "$cb_msg_id"
                 ask_update_all ;;
