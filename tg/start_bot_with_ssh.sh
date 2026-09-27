@@ -54,9 +54,14 @@ if tg_test_connection; then
     echo "[$(date)] Telegram API connection OK"
 else
     echo "[$(date)] WARNING: Cannot reach Telegram API. Check proxy settings."
+    # Не прерываем здесь: пусть пользователь увидит подробный
+    # ERROR в логе самого бота (срабатывает в mk_tg_bot.sh).
 fi
 
 # --- Start the bot ---
 echo "[$(date)] Launching bot..."
+# Пробу уже сделали — внутри бота повторный прогон tg_test_connection
+# пропустим, чтобы не дублировать строки в логе.
+export MK_BOT_SKIP_TEST=1
 exec "$SCRIPT_DIR/mk_tg_bot.sh"
 
