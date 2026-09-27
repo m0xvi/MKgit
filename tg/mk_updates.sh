@@ -165,8 +165,74 @@ rup_lock_release() {
     rm -rf "$(rup_state_dir)/lock_$1" 2>/dev/null || true
 }
 
+# Снять локи, чей pid уже мёртв (после kill/reboot/nohup без trap).
+rup_reap_stale_locks() {
+    local d lock pid
+    d=$(rup_state_dir)
+    [ -d "$d" ] || return 0
+    shopt -s nullglob
+    for lock in "$d"/lock_*; do
+        [ -d "$lock" ] || continue
+        pid=$(cat "$lock/pid" 2>/dev/null || true)
+        if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+            rm -rf "$lock"
+        fi
+    done
+    shopt -u nullglob
+    pid=$(cat "$d/worker_last.pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$d/worker_last.pid"
+    fi
+}
+
+rup_busy_report() {
+    rup_reap_stale_locks
+    local d="$(rup_state_dir)" html="" lock pid cmd n=0
+    shopt -s nullglob
+    for lock in "$d"/lock_*; do
+        [ -d "$lock" ] || continue
+        pid=$(cat "$lock/pid" 2>/dev/null || echo "?")
+        cmd=$(ps -o args= -p "$pid" 2>/dev/null | tr '\n' ' ' | cut -c1-80)
+        html+="• <code>$(basename "$lock")</code> pid=$pid ${cmd:-мёртв}\\n"
+        n=$((n+1))
+    done
+    shopt -u nullglob
+    if [ "$n" = 0 ]; then
+        echo "ℹ️ Фоновых операций обновлений нет (локи чистые)."
+        return 1
+    fi
+    echo "⏳ <b>Фон ($n):</b>\\n$html"
+    return 0
+}
+
+# Принудительно: SIGTERM/KILL воркерам mk_updates.sh + снять все локи.
+rup_force_abort() {
+    local d="$(rup_state_dir)" lock pid
+    rup_stop_set
+    shopt -s nullglob
+    for lock in "$d"/lock_*; do
+        pid=$(cat "$lock/pid" 2>/dev/null || true)
+        [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+    done
+    pid=$(cat "$d/worker_last.pid" 2>/dev/null || true)
+    [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+    sleep 2
+    for lock in "$d"/lock_*; do
+        pid=$(cat "$lock/pid" 2>/dev/null || true)
+        [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+        rm -rf "$lock"
+    done
+    shopt -u nullglob
+    [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+    # не трогаем mk_tg_bot.sh
+    pkill -f '/mk_updates.sh (apply|applylist|updateall|check|routerboard)' 2>/dev/null || true
+    rm -f "$d/worker_last.pid"
+    rup_stop_clear
+    rup_log "FORCE ABORT: locks cleared"
+}
+
 rup_busy_message() {
-    rup_send "⏳ Над <b>$1</b> уже выполняется операция. Дождитесь завершения."
+    rup_send "⏳ Над <b>$1</b> уже выполняется операция. Дождитесь завершения или сбросьте фон в меню обновлений."
 }
 
 # -----------------------------------------------------------------------------
@@ -904,6 +970,55 @@ rup_worker_update_all() {
     return "$err"
 }
 
+# Список имён из $(rup_state_dir)/apply_list.txt — по очереди, как updateall.
+rup_worker_apply_list() {
+    rup_ensure_dirs
+    local listf="$(rup_state_dir)/apply_list.txt"
+    if [ ! -s "$listf" ]; then
+        rup_send "❌ Список устройств для обновления пуст."
+        return 1
+    fi
+    if ! rup_lock_acquire update_all 5; then
+        rup_busy_message "обновление выбранных устройств"
+        return 1
+    fi
+    rup_stop_clear
+    local -a names=()
+    local name
+    while IFS= read -r name; do
+        name=$(echo "$name" | tr -d '\r' | xargs)
+        [ -n "$name" ] && names+=("$name")
+    done < "$listf"
+    local total=${#names[@]}
+    rup_send_stop "🔄 <b>Обновление выбранных устройств</b> ($total): $(printf '%s ' "${names[@]}")\\nПо одному, с проверкой. ⏹ — стоп после текущего."
+    local n=0 ok=0 err=0 skp=0 stopped=0 tsv status det
+    for name in "${names[@]}"; do
+        if rup_stop_requested; then rup_stop_clear; stopped=1; break; fi
+        n=$((n+1))
+        rup_send_stop "▶️ [$n/$total] <b>$name</b>…"
+        tsv=$(rup_check_device "$name")
+        IFS=$'\t' read -r _ status _ _ _ _ det <<< "$tsv"
+        case "$status" in
+            UPDATE)
+                if rup_worker_apply "$name"; then ok=$((ok+1)); else err=$((err+1)); fi ;;
+            CURRENT)
+                if rup_worker_rb "$name"; then ok=$((ok+1)); else err=$((err+1)); fi ;;
+            BUSY)
+                skp=$((skp+1)); rup_send "⏭️ [$n/$total] <b>$name</b>: занят — пропущен." ;;
+            *)
+                err=$((err+1)); rup_send "⚠️ [$n/$total] <b>$name</b>: ${det:-ошибка} — пропущен." ;;
+        esac
+    done
+    if [ "$stopped" = "1" ]; then
+        rup_send "🛑 Выборочное обновление остановлено ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err"
+    else
+        rup_send "📊 <b>Выборочное обновление завершено</b> ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err"
+    fi
+    rup_stop_clear
+    rup_lock_release "update_all"
+    return "$err"
+}
+
 # -----------------------------------------------------------------------------
 # ПЕЧАТЬ КЕША ПОСЛЕДНЕЙ ПРОВЕРКИ (для мгновенного /updates status)
 # -----------------------------------------------------------------------------
@@ -988,10 +1103,12 @@ rup_main() {
             rup_worker_rb "${2:-}" ;;
         updateall)
             rup_worker_update_all ;;
+        applylist)
+            rup_worker_apply_list ;;
         status)
             rup_print_cached_status ;;
         *)
-            echo "Использование: mk_updates.sh {check [all|device] | apply device | routerboard device | updateall | status}" >&2
+            echo "Использование: mk_updates.sh {check [all|device] | apply device | routerboard device | updateall | applylist | status}" >&2
             exit 2 ;;
     esac
 
