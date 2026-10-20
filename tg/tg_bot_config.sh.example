@@ -11,7 +11,24 @@ export TELEGRAM_CHAT_ID=""
 # --- Paths ---
 export CONFIG_FILE="/home/aionis/MikroGit/devices.conf"
 export BACKUP_SCRIPT="/home/aionis/MikroGit/MikroGit.sh"
+# Каталог бэкапов и логов. ВАЖНО: бот и MikroGit.sh должны смотреть в ОДИН
+# каталог, иначе бот «не видит» бэкапы. Если BACKUP_DIR не задан — берётся
+# <папка проекта>/bckp.
+export BACKUP_DIR="/home/aionis/MikroGit/bckp"
 export LOG_FILE="/home/aionis/MikroGit/logs/mk_backup.log"
+# Отчёты о бэкапах (раньше сыпались в корень bckp/)
+export REPORTS_DIR="/home/aionis/MikroGit/logs/reports"
+
+# --- Ротация (MikroGit.sh + автоочистка) ---
+# Сколько бэкапов хранить на устройство. Плановые и «перед обновлением»
+# считаются РАЗДЕЛЬНО (бэкап перед обновлением не вымывается плановыми).
+export MAX_BACKUPS_PER_DEVICE=5
+export MAX_PRE_UPDATE_BACKUPS=5
+export MAX_REPORTS=5
+# Через сколько дней удалять старые ~/deploy_key_*.log и сколько хранить архивов логов
+export MKC_HOME_LOG_DAYS=7
+export MKC_LOG_KEEP=3
+export MKC_LOG_MAX_BYTES=10485760
 
 # --- Proxy Settings (REQUIRED for Russia) ---
 # Supported types: http, socks5, socks5h
@@ -56,8 +73,13 @@ export SSH_KEY="$HOME/.ssh/mk_key"
 # устройстве). Для единообразия на всех устройствах обычно задают stable.
 export UPDATE_CHANNEL="stable"
 
-# Делать резервную копию конфигурации (MikroGit.sh --device) перед установкой
+# Делать резервную копию .backup перед установкой RouterOS (MikroGit.sh
+# --device <имя> --pre-update). Файл ложится в bckp/<устройство>/ с префиксом
+# pre_update_ и виден в боте: 📥 Download → 🛡 Перед обновлением.
 export UPDATE_BACKUP_BEFORE_APPLY="1"
+
+# Делать .backup и перед обновлением RouterBOOT firmware (по умолчанию да)
+export UPDATE_BACKUP_BEFORE_RB="1"
 
 # Таймаут скачивания обновления на роутере, сек
 export UPDATE_DOWNLOAD_TIMEOUT="900"
@@ -113,7 +135,7 @@ export DEPLOY_TARGET_GROUP="mikrogit"
 # Политики группы DEPLOY_TARGET_GROUP (используются при её создании).
 # ssh,read,write,test,reboot,policy — минимум, при котором работают бэкапы и
 # установка обновлений RouterOS из самого роутера. Меняйте осознанно.
-export DEPLOY_TARGET_POLICY="ssh,read,write,test,reboot,policy"
+export DEPLOY_TARGET_POLICY="ssh,read,write,test,reboot,policy,ftp"
 # Целевой пользователь (пусто = пользователь из 4-го поля devices.conf)
 export DEPLOY_TARGET_USER=""
 # Пароль для СОЗДАВАЕМОГО пользователя (пусто = случайный, будет в логе)
@@ -126,3 +148,25 @@ export DEPLOY_SSH_PROBE="1"
 export DEPLOY_SSH_VERIFY="1"
 # Wall-clock лимит на одно устройство, сек
 export DEPLOY_ONE_TIMEOUT="600"
+
+# =============================================================================
+# Расписание бэкапов и обновлений (tg/mk_schedule.sh)
+# =============================================================================
+# Значения по умолчанию; меняются из бота: меню «🗓 Расписание» и хранятся в
+# logs/schedule/schedule.conf (их значения важнее этих).
+#   SCHED_ENABLED          — 1 = планировщик включён
+#   SCHED_BACKUP_ENABLED   — 1 = бэкап всех устройств ежедневно
+#   SCHED_BACKUP_HOUR/MINUTE — время ежедневного бэкапа (03:00)
+#   SCHED_UPDATE_ENABLED   — 1 = проверка/установка обновлений раз в неделю
+#   SCHED_UPDATE_WEEKDAY   — день недели (1=Пн … 7=Вс), по умолчанию 7 (Вс)
+#   SCHED_UPDATE_HOUR/MINUTE — время обновлений (04:00)
+#   SCHED_UPDATE_MODE      — check (только проверка + отчёт) | apply (автоустановка)
+export SCHED_ENABLED=1
+export SCHED_BACKUP_ENABLED=1
+export SCHED_BACKUP_HOUR=3
+export SCHED_BACKUP_MINUTE=0
+export SCHED_UPDATE_ENABLED=1
+export SCHED_UPDATE_WEEKDAY=7
+export SCHED_UPDATE_HOUR=4
+export SCHED_UPDATE_MINUTE=0
+export SCHED_UPDATE_MODE="check"

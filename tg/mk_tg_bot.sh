@@ -49,6 +49,37 @@ else
     echo "ERROR: mk_harden.sh not found" >&2
 fi
 
+# --- Load backup file helpers (.backup/.rsc, пометка pre_update) ---
+if [ -f "$SCRIPT_DIR/mk_backup_lib.sh" ]; then
+    source "$SCRIPT_DIR/mk_backup_lib.sh"
+else
+    echo "ERROR: mk_backup_lib.sh not found" >&2
+fi
+
+# --- Load cleanup helpers (логи/отчёты/мусор) ---
+if [ -f "$SCRIPT_DIR/mk_cleanup.sh" ]; then
+    source "$SCRIPT_DIR/mk_cleanup.sh"
+fi
+
+# --- Load schedule (расписание бэкапов/обновлений) ---
+if [ -f "$SCRIPT_DIR/mk_schedule.sh" ]; then
+    source "$SCRIPT_DIR/mk_schedule.sh"
+fi
+
+# Каталог бэкапов (раньше был захардкожен /home/aionis/MikroGit/bckp — из-за
+# этого бот не видел бэкапы, если проект лежал в другом месте или BACKUP_DIR
+# задан в конфиге).
+BACKUP_DIR="${BACKUP_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)/bckp}"
+BACKUP_DIR="${BACKUP_DIR%/}"
+# Лимиты ротации по умолчанию (те же, что у MikroGit.sh) — чтобы меню
+# «Обслуживание» работало даже без tg_bot_config.sh.
+MAX_BACKUPS_PER_DEVICE="${MAX_BACKUPS_PER_DEVICE:-5}"
+MAX_PRE_UPDATE_BACKUPS="${MAX_PRE_UPDATE_BACKUPS:-5}"
+MAX_REPORTS="${MAX_REPORTS:-5}"
+MKC_HOME_LOG_DAYS="${MKC_HOME_LOG_DAYS:-7}"
+# Каталог отчётов (отчёты больше не лежат в корне bckp/)
+REPORTS_DIR="${REPORTS_DIR:-$(dirname "${LOG_FILE:-$SCRIPT_DIR/../logs/mk_backup.log}")/reports}"
+
 # --- Colors ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -158,14 +189,14 @@ perform_backup() {
     tg_send_message "$TELEGRAM_CHAT_ID" "🔄 <b>Starting backup:</b> $device_name"
 
     if [ "$device_name" = "all" ]; then
-        if $BACKUP_SCRIPT --telegram "manual" >> "$LOG_FILE" 2>&1; then
+        if bash "$BACKUP_SCRIPT" --telegram "manual" >> "$LOG_FILE" 2>&1; then
             log "Backup all completed successfully"
         else
             tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Backup failed!</b> Check logs."
             error "Backup failed for all devices"
         fi
     else
-        if $BACKUP_SCRIPT --device "$device_name" --telegram "manual" >> "$LOG_FILE" 2>&1; then
+        if bash "$BACKUP_SCRIPT" --device "$device_name" --telegram "manual" >> "$LOG_FILE" 2>&1; then
             tg_send_message "$TELEGRAM_CHAT_ID" "✅ <b>Backup OK!</b>\nDevice: $device_name"
             log "Backup OK: $device_name"
         else
@@ -216,7 +247,7 @@ fi
 pid_file="$d/worker.pid"
 lock_dir="$d/lock_backup"
 trap 'rm -f "\$pid_file"; rm -rf "\$lock_dir"; exit 130' TERM INT
-"\$BACKUP_SCRIPT" --telegram "manual"
+bash "\$BACKUP_SCRIPT" --telegram "manual"
 rc=\$?
 rm -f "\$pid_file"
 rm -rf "\$lock_dir"
@@ -259,32 +290,39 @@ backup_stop_now() {
 
 # --- Backup status ---
 get_backup_status() {
-    local status_report="📊 <b>Backup Status Report</b>\n\n"
-    local total_devices=0 backed_up_devices=0
+    local status_report="📊 <b>Статус бэкапов</b>\n\n"
+    local total_devices=0 backed_up_devices=0 with_pre=0
+    local name ip port user description
 
     while IFS=':' read -r name ip port user description; do
         [[ $name =~ ^# ]] || [[ -z $name ]] && continue
         ((total_devices++))
-        local backup_dir="/home/aionis/MikroGit/bckp/$name"
-        local latest_backup=$(ls -1t "$backup_dir"/*.rsc 2>/dev/null | head -1)
+        local dir="$BACKUP_DIR/$name"
+        local latest pre
+        latest=$(bkl_latest "$dir" regular)
+        pre=$(bkl_latest "$dir" pre)
+        [ -n "$pre" ] && ((with_pre++))
 
-        if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
-            local backup_time=$(stat -c %y "$latest_backup" 2>/dev/null | cut -d'.' -f1)
-            local file_size=$(stat -c%s "$latest_backup" 2>/dev/null)
-            local time_diff=$(( ($(date +%s) - $(date -d "$backup_time" +%s)) / 3600 ))
-            if [ $time_diff -lt 24 ]; then
-                status_report+="✅ <b>$name</b>\n   🕐 $backup_time (${time_diff}h ago)\n"
-            else
-                status_report+="⚠️ <b>$name</b>\n   🕐 $backup_time ($((time_diff/24))d ago)\n"
-            fi
-            status_report+="   📁 $((file_size/1024)) KB\n\n"
+        if [ -n "$latest" ] && [ -f "$latest" ]; then
+            local mt size age_h age_txt
+            mt=$(bkl_mtime "$latest")
+            size=$(bkl_size_h "$latest")
+            age_h=$(( ($(date +%s) - $(stat -c %Y "$latest" 2>/dev/null || date +%s)) / 3600 ))
+            if [ "$age_h" -lt 24 ]; then age_txt="${age_h}ч назад"; else age_txt="$((age_h/24))д назад"; fi
+            if [ "$age_h" -lt 48 ]; then status_report+="✅ <b>$name</b> — $size, $age_txt\n"; else status_report+="⚠️ <b>$name</b> — $size, $age_txt\n"; fi
+            status_report+="   🕐 $mt\n   📄 <code>$(basename "$latest")</code>\n"
             ((backed_up_devices++))
         else
-            status_report+="❌ <b>$name</b>\n   📅 No backups\n\n"
+            status_report+="❌ <b>$name</b> — нет бэкапов\n"
         fi
+        if [ -n "$pre" ]; then
+            status_report+="   🛡 перед обновлением: <code>$(basename "$pre")</code> ($(bkl_mtime "$pre"))\n"
+        fi
+        status_report+="\n"
     done < "$CONFIG_FILE"
 
-    status_report+="📈 <b>Summary:</b> $backed_up_devices/$total_devices devices backed up"
+    status_report+="📈 <b>Итого:</b> с бэкапами $backed_up_devices/$total_devices • с 🛡 pre_update: $with_pre\n"
+    status_report+="📁 Каталог: <code>$BACKUP_DIR</code>"
     tg_send_message "$TELEGRAM_CHAT_ID" "$status_report"
 }
 
@@ -424,26 +462,27 @@ remove_device() {
 # --- Backup download ---
 list_backups_for_download() {
     local device_name="$1"
-    local backup_dir="/home/aionis/MikroGit/bckp/$device_name"
+    local dir="$BACKUP_DIR/$device_name"
 
-    if [ ! -d "$backup_dir" ] || [ -z "$(ls -1 "$backup_dir"/*.rsc 2>/dev/null)" ]; then
-        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>No backups for:</b> $device_name"
+    local files total
+    files=$(bkl_list_backups "$dir" all)
+    if [ -z "$files" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Нет бэкапов:</b> $device_name\nКаталог: <code>$dir</code>"
         return 1
     fi
 
-    local backup_list="📂 <b>$device_name backups:</b>\n\n"
-    local count=1
-    local keyboard='['
-
-    for backup_file in $(ls -1t "$backup_dir"/*.rsc 2>/dev/null | head -10); do
-        local filename=$(basename "$backup_file")
-        local file_size=$(stat -c%s "$backup_file" 2>/dev/null)
-        local backup_time=$(stat -c %y "$backup_file" 2>/dev/null | cut -d'.' -f1)
-        backup_list+="$count. <code>$filename</code>\n   📅 $backup_time  📁 $((file_size/1024)) KB\n\n"
-        # Use a safe delimiter: we encode device+filename with a double underscore separator
-        keyboard+='[{"text": "#'$count' - '$filename'", "callback_data": "dl_'$device_name'__'$filename'"}],'
-        ((count++))
-    done
+    local backup_list="📂 <b>Бэкапы $device_name</b>\n<code>$dir</code>\n\n"
+    local keyboard='[' n=0 f
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        n=$((n+1))
+        [ "$n" -le 12 ] || continue
+        local mark; mark=$(bkl_label "$f")
+        backup_list+="$n. <code>$(basename "$f")</code>\n   $mark • $(bkl_size_h "$f") • $(bkl_mtime "$f")\n\n"
+        keyboard+='[{"text": "#'$n' - '$(basename "$f")'", "callback_data": "dl2_'$device_name'__'$n'"}],'
+    done <<< "$files"
+    total=$(printf '%s\n' "$files" | grep -c . || true)
+    [ "$total" -gt 12 ] && backup_list+="…и ещё $((total - 12)) (показаны 12 самых свежих)\n\n"
     keyboard+='[{"text": "🔙 Back", "callback_data": "download_menu"}]'
     keyboard+=']'
 
@@ -452,82 +491,120 @@ list_backups_for_download() {
 
 send_backup_file() {
     local device_name="$1" filename="$2"
-    local backup_file="/home/aionis/MikroGit/bckp/$device_name/$filename"
+    local backup_file="$BACKUP_DIR/$device_name/$filename"
 
     log "Sending backup: $device_name / $filename"
 
     if [ ! -f "$backup_file" ]; then
-        local available=$(ls -1 "/home/aionis/MikroGit/bckp/$device_name/"*.rsc 2>/dev/null | head -5 | xargs -I {} basename {} | tr '\n' ', ')
-        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>File not found:</b> $filename\nAvailable: $available"
+        local available
+        available=$(bkl_list_backups "$BACKUP_DIR/$device_name" all | head -5 | xargs -r -I{} basename {} | tr '\n' ', ')
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Файл не найден:</b> $filename\nЕсть: $available"
         return 1
     fi
 
-    local file_size=$(stat -c%s "$backup_file")
-    local max_size=50000000  # 50 MB Telegram limit
+    local file_size
+    file_size=$(stat -c%s "$backup_file" 2>/dev/null || echo 0)
+    local max_size=50000000  # ~50 MB лимит Telegram
 
-    if [ $file_size -gt $max_size ]; then
-        local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ "$file_size" -gt "$max_size" ]; then
+        local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}')
         ip="${ip:-YOUR_SERVER_IP}"
-        tg_send_message "$TELEGRAM_CHAT_ID" "📁 <b>File too large</b> ($((file_size/1024/1024)) MB)\nDownload via SSH:\n<code>scp aionis@$ip:$backup_file .</code>"
+        tg_send_message "$TELEGRAM_CHAT_ID" "📁 <b>Файл слишком большой</b> ($((file_size/1024/1024)) MB)\nСкачайте по SSH:\n<code>scp $USER@$ip:$backup_file .</code>"
         return 1
     fi
 
-    tg_send_document "$TELEGRAM_CHAT_ID" "$backup_file"
-    if [ $? -eq 0 ]; then
+    local caption="$(bkl_label "$backup_file") • $device_name\n<code>$(basename "$backup_file")</code> • $(bkl_size_h "$backup_file")"
+    if tg_send_document "$TELEGRAM_CHAT_ID" "$backup_file" "$caption"; then
         log "Backup sent: $filename"
         return 0
     else
-        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Failed to send:</b> $filename"
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Не удалось отправить:</b> $filename"
         return 1
     fi
 }
 
-get_latest_backup() {
-    local device_name="$1"
-    local backup_dir="/home/aionis/MikroGit/bckp/$device_name"
-    local latest_backup=$(ls -1t "$backup_dir"/*.rsc 2>/dev/null | head -1)
-    if [ -z "$latest_backup" ]; then
-        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>No backups for:</b> $device_name"
+# Отправка по номеру из списка (callback_data dl2_<device>__<n>) — так кнопка
+# не упирается в 64-байтный лимит callback_data на длинных именах файлов.
+send_backup_by_index() {
+    local device_name="$1" idx="$2" f
+    f=$(bkl_list_backups "$BACKUP_DIR/$device_name" all | sed -n "${idx}p")
+    if [ -z "$f" ] || [ ! -f "$f" ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ Файл #$idx не найден — список изменился. Откройте 📥 Download заново."
         return 1
     fi
-    local filename=$(basename "$latest_backup")
-    tg_send_message "$TELEGRAM_CHAT_ID" "📥 <b>Sending latest:</b> $device_name / $filename"
+    send_backup_file "$device_name" "$(basename "$f")"
+}
+
+get_latest_backup() {
+    local device_name="$1" kind="${2:-regular}"
+    local dir="$BACKUP_DIR/$device_name"
+    local latest_backup
+    latest_backup=$(bkl_latest "$dir" "$kind")
+    if [ -z "$latest_backup" ]; then
+        local note=""
+        [ "$kind" = "regular" ] && [ -n "$(bkl_latest "$dir" pre)" ] && \
+            note="\n(есть только 🛡 бэкап перед обновлением — /latest-pre $device_name)"
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Нет бэкапов:</b> $device_name$note"
+        return 1
+    fi
+    local filename; filename=$(basename "$latest_backup")
+    tg_send_message "$TELEGRAM_CHAT_ID" "📥 <b>Последний бэкап:</b> $device_name\n<code>$filename</code> — $(bkl_label "$latest_backup")"
     send_backup_file "$device_name" "$filename"
 }
 
 send_latest_backups() {
-    local count=0 devices_with_backups=0 total_devices=0
+    local count=0 devices_with_backups=0 total_devices=0 name ip port user description
 
     while IFS=':' read -r name ip port user description; do
         [[ $name =~ ^# ]] || [[ -z $name ]] && continue
         ((total_devices++))
-        local backup_dir="/home/aionis/MikroGit/bckp/$name"
-        local lb=$(ls -1t "$backup_dir"/*.rsc 2>/dev/null | head -1)
-        [ -n "$lb" ] && [ -f "$lb" ] && ((devices_with_backups++))
+        [ -n "$(bkl_latest "$BACKUP_DIR/$name" regular)" ] && ((devices_with_backups++))
     done < "$CONFIG_FILE"
 
-    if [ $devices_with_backups -eq 0 ]; then
-        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>No backups found!</b>"
+    if [ "$devices_with_backups" -eq 0 ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Бэкапов не найдено!</b>"
         return 1
     fi
 
-    tg_send_message "$TELEGRAM_CHAT_ID" "📥 <b>Sending latest backups...</b>\n$devices_with_backups/$total_devices devices have backups"
+    tg_send_message "$TELEGRAM_CHAT_ID" "📥 <b>Отправляю последние бэкапы…</b>\n$devices_with_backups/$total_devices устройств имеют бэкапы"
 
     while IFS=':' read -r name ip port user description; do
         [[ $name =~ ^# ]] || [[ -z $name ]] && continue
-        local backup_dir="/home/aionis/MikroGit/bckp/$name"
-        local lb=$(ls -1t "$backup_dir"/*.rsc 2>/dev/null | head -1)
+        local lb; lb=$(bkl_latest "$BACKUP_DIR/$name" regular)
         if [ -n "$lb" ] && [ -f "$lb" ]; then
-            if send_backup_file "$name" "$(basename "$lb")"; then
-                ((count++))
-            fi
-            sleep 2  # Rate limit protection
+            if send_backup_file "$name" "$(basename "$lb")"; then ((count++)); fi
+            sleep 2  # защита от rate limit Telegram
         fi
     done < "$CONFIG_FILE"
 
-    [ $count -gt 0 ] \
-        && tg_send_message "$TELEGRAM_CHAT_ID" "✅ <b>Done!</b> Sent $count backup files." \
-        || tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Failed to send any files!</b>"
+    if [ "$count" -gt 0 ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "✅ <b>Готово!</b> Отправлено файлов: $count.\n🛡 Бэкапы перед обновлением — в меню 📥 Download → 🛡 Перед обновлением."
+    else
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Не удалось отправить ни одного файла!</b>"
+    fi
+}
+
+# Список устройств, у которых есть бэкапы ПЕРЕД обновлением
+show_pre_update_menu() {
+    local keyboard='[' has=0 name ip port user description pre
+    while IFS=':' read -r name ip port user description; do
+        [[ $name =~ ^# ]] || [[ -z $name ]] && continue
+        pre=$(bkl_latest "$BACKUP_DIR/$name" pre)
+        if [ -n "$pre" ]; then
+            local pdate; pdate=$(basename "$pre" | sed -E 's/.*_([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})-([0-9]{2})-[0-9]{2}\..*/\1 \2:\3/')
+            local btn="🛡 $name — ${pdate:-$(basename "$pre")}"
+            keyboard+='[{"text": "'"$btn"'", "callback_data": "download_list_'$name'"}],'
+            has=1
+        fi
+    done < "$CONFIG_FILE"
+    if [ "$has" -eq 0 ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "🛡 <b>Бэкапов перед обновлением пока нет.</b>\n\nОни создаются автоматически перед установкой RouterOS/RouterBOOT и лежат в <code>$BACKUP_DIR/<устройство>/</code> с префиксом <code>pre_update_</code>."
+        show_download_menu
+        return 0
+    fi
+    keyboard+='[{"text": "🔙 Back", "callback_data": "download_menu"}]'
+    keyboard+=']'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🛡 <b>Бэкапы перед обновлением</b>\n\nЭто копии, снятые автоматически перед установкой обновлений. Не удаляются плановой ротацией (свой лимит).\n<code>$BACKUP_DIR/<устройство>/</code>" "$keyboard"
 }
 
 # =============================================================================
@@ -672,6 +749,7 @@ show_menu() {
         [{"text": "📋 List Devices", "callback_data": "list_devices"}, {"text": "🔑 SSH Keys", "callback_data": "ssh_keys_menu"}],
         [{"text": "⬆️ Обновления RouterOS", "callback_data": "upd_menu"}],
         [{"text": "🔑 Деплой ключей/прав", "callback_data": "deploy_menu"}, {"text": "🛡 Сервисы/SSH", "callback_data": "hdn_menu"}],
+        [{"text": "🗓 Расписание", "callback_data": "sch_menu"}, {"text": "🧹 Обслуживание", "callback_data": "maint_menu"}],
         [{"text": "📜 Логи", "callback_data": "logs_menu"}, {"text": "➕ Add Device", "callback_data": "add_device"}]
     ]'
     tg_send_keyboard "$TELEGRAM_CHAT_ID" "🤖 <b>MikroTik Backup Bot</b>\nChoose an action:" "$keyboard"
@@ -693,21 +771,28 @@ show_backup_menu() {
 }
 
 show_download_menu() {
-    local keyboard='['
-    local has_backups=0
+    local keyboard='[' has_backups=0 has_pre=0 name ip port user description
     while IFS=':' read -r name ip port user description; do
         [[ $name =~ ^# ]] || [[ -z $name ]] && continue
-        local backup_dir="/home/aionis/MikroGit/bckp/$name"
-        if [ -d "$backup_dir" ] && [ -n "$(ls -1 "$backup_dir"/*.rsc 2>/dev/null)" ]; then
-            keyboard+='[{"text": "📂 '$name'", "callback_data": "download_list_'$name'"}],'
+        if [ -n "$(bkl_latest "$BACKUP_DIR/$name" regular)" ]; then
+            local n_pre; n_pre=$(bkl_count "$BACKUP_DIR/$name" pre)
+            local mark="" btn
+            [ "$n_pre" -gt 0 ] && mark=" 🛡$n_pre"
+            btn="📂 $name$mark"
+            keyboard+='[{"text": "'"$btn"'", "callback_data": "download_list_'$name'"}],'
             has_backups=1
         fi
+        [ -n "$(bkl_latest "$BACKUP_DIR/$name" pre)" ] && has_pre=1
     done < "$CONFIG_FILE"
-    [ $has_backups -eq 0 ] && { tg_send_message "$TELEGRAM_CHAT_ID" "No backups found!"; return 1; }
-    keyboard+='[{"text": "📥 Download All Latest", "callback_data": "download_all_latest"}],'
+    if [ "$has_backups" -eq 0 ] && [ "$has_pre" -eq 0 ]; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Бэкапов не найдено.</b>\nКаталог: <code>$BACKUP_DIR</code>\nЗапустите «🔄 Backup All»."
+        return 1
+    fi
+    keyboard+='[{"text": "📥 Все последние", "callback_data": "download_all_latest"}],'
+    [ "$has_pre" -eq 1 ] && keyboard+='[{"text": "🛡 Перед обновлением", "callback_data": "download_pre_menu"}],'
     keyboard+='[{"text": "🔙 Back", "callback_data": "menu"}]'
     keyboard+=']'
-    tg_send_keyboard "$TELEGRAM_CHAT_ID" "📥 <b>Select device:</b>" "$keyboard"
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "📥 <b>Скачать бэкап</b>\n<code>$BACKUP_DIR</code>\n\n🛡N — сколько бэкапов перед обновлением есть у устройства." "$keyboard"
 }
 
 # =============================================================================
@@ -1147,6 +1232,112 @@ cancel_harden_device() {
 }
 
 # =============================================================================
+# SCHEDULE: расписание бэкапов и обновлений (см. mk_schedule.sh)
+# =============================================================================
+
+sch_hour_shift() {
+    # $1 = текущее значение, $2 = +1/-1, $3 = шаг
+    local v=$((10#${1:-0})) step="${3:-1}"
+    v=$(( v + ${2} * step ))
+    [ "$v" -gt 23 ] && v=0
+    [ "$v" -lt 0 ] && v=23
+    echo "$v"
+}
+
+sch_minute_shift() {
+    local v=$((10#${1:-0})) step="${2:-15}"
+    v=$(( v + step ))
+    [ "$v" -ge 60 ] && v=0
+    [ "$v" -lt 0 ] && v=45
+    echo "$v"
+}
+
+show_schedule_menu() {
+    if ! declare -f msch_load > /dev/null 2>&1; then
+        tg_send_message "$TELEGRAM_CHAT_ID" "⚠️ Модуль расписания (mk_schedule.sh) не найден рядом с ботом."
+        return 1
+    fi
+    msch_load
+    # при включённом расписании гарантируем живой демон
+    if [ "$SCHED_ENABLED" = "1" ]; then msch_daemon_ensure > /dev/null 2>&1 || true; fi
+
+    local demon="⛔ демон не запущен"
+    msch_daemon_running && demon="✅ демон работает (pid=$(msch_daemon_pid 2>/dev/null))"
+
+    local toggle="✅ Включить расписание"
+    [ "$SCHED_ENABLED" = "1" ] && toggle="⛔ Выключить расписание"
+    local mode="🔎 Режим: только проверка"
+    [ "$SCHED_UPDATE_MODE" = "apply" ] && mode="🚀 Режим: автоустановка"
+    local bh bm uh um
+    bh=$((10#${SCHED_BACKUP_HOUR:-0})); bm=$((10#${SCHED_BACKUP_MINUTE:-0}))
+    uh=$((10#${SCHED_UPDATE_HOUR:-0})); um=$((10#${SCHED_UPDATE_MINUTE:-0}))
+
+    local kb='['
+    kb+='[{"text": "'$toggle'", "callback_data": "sch_toggle"}],'
+    kb+='[{"text": "📦 Бэкап ежедневно в '$(printf '%02d:%02d' "$bh" "$bm")'", "callback_data": "sch_noop"}],'
+    kb+='[{"text": "−1 ч", "callback_data": "sch_bh_minus"}, {"text": "−15 мин", "callback_data": "sch_bm_minus"}, {"text": "+15 мин", "callback_data": "sch_bm_plus"}, {"text": "+1 ч", "callback_data": "sch_bh_plus"}],'
+    kb+='[{"text": "⬆️ Обновления: '$(msch_weekday_name "$SCHED_UPDATE_WEEKDAY")' в '$(printf '%02d:%02d' "$uh" "$um")'", "callback_data": "sch_noop"}],'
+    kb+='[{"text": "−1 ч", "callback_data": "sch_uh_minus"}, {"text": "−15 мин", "callback_data": "sch_um_minus"}, {"text": "+15 мин", "callback_data": "sch_um_plus"}, {"text": "+1 ч", "callback_data": "sch_uh_plus"}],'
+    kb+='[{"text": "📅 День: '$(msch_weekday_name "$SCHED_UPDATE_WEEKDAY")'", "callback_data": "sch_wd_next"}, {"text": "'$mode'", "callback_data": "sch_mode"}],'
+    kb+='[{"text": "▶️ Бэкап сейчас", "callback_data": "sch_run_backup"}, {"text": "🔎 Проверить обновления", "callback_data": "sch_run_check"}],'
+    kb+='[{"text": "🔙 Back", "callback_data": "menu"}]'
+    kb+=']'
+
+    local txt="🗓 <b>Расписание</b>\n\n"
+    txt+="$(msch_plan_text)\n\n"
+    txt+="<i>$demon</i>\n\n"
+    txt+="Изменения сохраняются сразу. Часы — по времени сервера ($(date +%Z), сейчас $(date '+%H:%M'))."
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "$txt" "$kb"
+}
+
+# =============================================================================
+# MAINTENANCE: автоочистка логов/отчётов/мусора (см. mk_cleanup.sh)
+# =============================================================================
+
+maint_usage_text() {
+    local du_b du_l nb np reports home_logs
+    du_b=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+    du_l=$(du -sh "$(dirname "${LOG_FILE:-/tmp/x}")" 2>/dev/null | awk '{print $1}')
+    nb=0; np=0
+    local name ip port user description
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS=':' read -r name ip port user description; do
+            [[ $name =~ ^# ]] || [[ -z $name ]] && continue
+            nb=$(( nb + $(bkl_count "$BACKUP_DIR/$name" regular) ))
+            np=$(( np + $(bkl_count "$BACKUP_DIR/$name" pre) ))
+        done < "$CONFIG_FILE"
+    fi
+    reports=$(find "${REPORTS_DIR:-/nonexistent}" -maxdepth 1 -name 'backup_report_*.txt' 2>/dev/null | wc -l)
+    home_logs=$(find "$HOME" -maxdepth 1 -name 'deploy_key_*.log' 2>/dev/null | wc -l)
+    printf '📦 Бэкапов: <b>%s</b> плановых + <b>%s</b> перед обновлением\n📁 bckp/: <b>%s</b>\n📜 logs/: <b>%s</b>\n🧾 Отчётов: <b>%s</b> (в %s)\n🏠 ~/deploy_key_*.log: <b>%s</b>' \
+        "$nb" "$np" "${du_b:-?}" "${du_l:-?}" "$reports" "${REPORTS_DIR:-?}" "$home_logs"
+}
+
+show_maint_menu() {
+    local kb='[
+        [{"text": "🧹 Очистить сейчас", "callback_data": "maint_run"}],
+        [{"text": "📊 Обновить статистику", "callback_data": "maint_menu"}],
+        [{"text": "🔙 Back", "callback_data": "menu"}]
+    ]'
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🧹 <b>Обслуживание и автоочистка</b>\n\n$(maint_usage_text)\n\n<b>Что чистится автоматически</b> (после каждого бэкапа и этим меню):\n• старые бэкапы (лимиты ротации: $MAX_BACKUPS_PER_DEVICE плановых / ${MAX_PRE_UPDATE_BACKUPS:-5} перед обновлением)\n• отчёты старше ${MAX_REPORTS:-5} штук — теперь в logs/reports/, а не в bckp/\n• рост логов (ротация по размеру, архивы .gz)\n• старые ~/deploy_key_*.log (старше ${MKC_HOME_LOG_DAYS:-7} дней)\n• пустые каталоги устройств и недокачанные *.part" "$kb"
+}
+
+run_maintenance_now() {
+    local before after out rc
+    before=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+    tg_send_message "$TELEGRAM_CHAT_ID" "🧹 Запускаю очистку…"
+    out=$(bash "$SCRIPT_DIR/mk_cleanup.sh" --backup-dir "$BACKUP_DIR" --log-file "${LOG_FILE:-$SCRIPT_DIR/../logs/mk_backup.log}" 2>&1)
+    rc=$?
+    after=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+    log "Maintenance rc=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-500)"
+    local tail_txt
+    tail_txt=$(printf '%s\n' "$out" | grep -E 'CLEANUP' | tail -n 12 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+    [ -z "$tail_txt" ] && tail_txt="(удалять было нечего)"
+    tg_send_message "$TELEGRAM_CHAT_ID" "✅ <b>Очистка завершена</b> (rc=$rc)\nbckp/: $before → <b>$after</b>\n\n<code>$tail_txt</code>"
+    show_maint_menu
+}
+
+# =============================================================================
 # UPDATE PROCESSING
 # =============================================================================
 
@@ -1235,7 +1426,63 @@ process_update() {
             add_device)         start_device_addition "$chat_id" ;;
             ssh_keys_menu)      show_ssh_keys_menu ;;
             download_menu)      show_download_menu ;;
+            download_pre_menu)  show_pre_update_menu ;;
             download_all_latest) send_latest_backups ;;
+            dl2_*)
+                local tmp2=${callback_data#dl2_}
+                local dname2="${tmp2%%__*}"
+                local idx2="${tmp2#*__}"
+                log "Download by index: device=$dname2 idx=$idx2"
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                send_backup_by_index "$dname2" "$idx2" ;;
+
+            # --- Расписание ---
+            sch_menu)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                show_schedule_menu ;;
+            sch_noop) : ;;
+            sch_toggle)
+                msch_load
+                if [ "$SCHED_ENABLED" = "1" ]; then msch_set ENABLED 0; else msch_set ENABLED 1; fi
+                show_schedule_menu ;;
+            sch_bh_plus)   msch_load; msch_set BACKUP_HOUR "$(sch_hour_shift "$SCHED_BACKUP_HOUR" 1)"; show_schedule_menu ;;
+            sch_bh_minus)  msch_load; msch_set BACKUP_HOUR "$(sch_hour_shift "$SCHED_BACKUP_HOUR" -1)"; show_schedule_menu ;;
+            sch_bm_plus)   msch_load; msch_set BACKUP_MINUTE "$(sch_minute_shift "$SCHED_BACKUP_MINUTE" 15)"; show_schedule_menu ;;
+            sch_bm_minus)  msch_load; msch_set BACKUP_MINUTE "$(sch_minute_shift "$SCHED_BACKUP_MINUTE" -15)"; show_schedule_menu ;;
+            sch_uh_plus)   msch_load; msch_set UPDATE_HOUR "$(sch_hour_shift "$SCHED_UPDATE_HOUR" 1)"; show_schedule_menu ;;
+            sch_uh_minus)  msch_load; msch_set UPDATE_HOUR "$(sch_hour_shift "$SCHED_UPDATE_HOUR" -1)"; show_schedule_menu ;;
+            sch_um_plus)   msch_load; msch_set UPDATE_MINUTE "$(sch_minute_shift "$SCHED_UPDATE_MINUTE" 15)"; show_schedule_menu ;;
+            sch_um_minus)  msch_load; msch_set UPDATE_MINUTE "$(sch_minute_shift "$SCHED_UPDATE_MINUTE" -15)"; show_schedule_menu ;;
+            sch_wd_next)
+                msch_load
+                local wd=$(( ${SCHED_UPDATE_WEEKDAY:-7} + 1 ))
+                [ "$wd" -gt 7 ] && wd=1
+                msch_set UPDATE_WEEKDAY "$wd"
+                show_schedule_menu ;;
+            sch_mode)
+                msch_load
+                if [ "$SCHED_UPDATE_MODE" = "apply" ]; then msch_set UPDATE_MODE check; else msch_set UPDATE_MODE apply; fi
+                show_schedule_menu ;;
+            sch_run_backup)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                if declare -f msch_run_backup > /dev/null 2>&1; then
+                    tg_send_message "$chat_id" "▶️ Запускаю плановый бэкап всех устройств (как по расписанию)…"
+                    msch_run_backup
+                else
+                    tg_send_message "$chat_id" "⚠️ Модуль расписания не загружен."
+                fi ;;
+            sch_run_check)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                start_update_check ;;
+
+            # --- Обслуживание ---
+            maint_menu)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                show_maint_menu ;;
+            maint_run)
+                tg_clear_keyboard "$chat_id" "$cb_msg_id"
+                run_maintenance_now ;;
+
 
             # --- RouterOS updates ---
             upd_menu)           show_updates_menu ;;
@@ -1472,6 +1719,12 @@ process_update() {
                 tg_send_message "$TELEGRAM_CHAT_ID" "❌ Usage: <code>/latest device_name</code>\nExample: <code>/latest GW_DONA</code>" ;;
             /latest\ *)
                 get_latest_backup "${message_text#/latest }" ;;
+            /latest-pre)
+                tg_send_message "$TELEGRAM_CHAT_ID" "❌ Использование: <code>/latest-pre device_name</code>" ;;
+            /latest-pre\ *)
+                get_latest_backup "${message_text#/latest-pre }" pre ;;
+            /schedule|/расписание)
+                show_schedule_menu ;;
             /remove)
                 tg_send_message "$TELEGRAM_CHAT_ID" "❌ Usage: <code>/remove device_name</code>" ;;
             /remove\ *)
@@ -1504,6 +1757,16 @@ run_bot() {
 
     tg_send_message "$TELEGRAM_CHAT_ID" "🤖 <b>MikroTik Backup Bot started!</b>"
     tg_send_message "$TELEGRAM_CHAT_ID" "Send /menu to begin"
+
+    # Планировщик (бэкап/обновления по расписанию) живёт отдельным демоном:
+    # поднимаем его при старте бота, чтобы расписание работало и после ребута.
+    if declare -f msch_daemon_ensure > /dev/null 2>&1; then
+        if msch_daemon_ensure; then
+            log "Планировщик запущен/уже работает (pid=$(msch_daemon_pid 2>/dev/null))"
+        else
+            log "Планировщик выключен или не смог стартовать (см. $(msch_log_file 2>/dev/null))"
+        fi
+    fi
 
     local offset=0
     while true; do
@@ -1561,5 +1824,9 @@ main() {
     run_bot
 }
 
-main "$@"
+# MK_BOT_LIB_ONLY=1 — только загрузить функции (для тестов/диагностики),
+# не запуская цикл бота с обращением к Telegram.
+if [ "${MK_BOT_LIB_ONLY:-0}" != "1" ]; then
+    main "$@"
+fi
 
