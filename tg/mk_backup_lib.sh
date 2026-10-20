@@ -123,6 +123,8 @@ bkl_reason_hint() {
     local r="${1:-}"
     [ -n "$r" ] || return 0
     case "$r" in
+        *"нет политик"*|*"scp/sftp не может"*)
+            echo "RouterOS не отдаёт .backup без политики sensitive: Winbox → System → Users → Groups → <группа> → Policy → включите sensitive, ftp, read" ;;
         *"политика ftp"*|*"scp/sftp"*|*"Not a directory"*|*"scp:"*)
             echo "у пользователя нет политики ftp — без неё scp/sftp не читают файлы: /user group set <группа> policy=...,ftp" ;;
         *"нет SSH-доступа"*|*"Cannot connect"*|*"Connection refused"*|*"Connection timed out"*|*"No route to host"*|*"Permission denied (publickey"*|*"Host key verification failed"*)

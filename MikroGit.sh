@@ -127,6 +127,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# --- Load bot config (token/chat_id/пути) ------------------------------------
+# ВАЖНО: конфиг загружается ДО хелперов — иначе TELEGRAM_PROXY из него
+# не попадёт в окружение и ручной запуск получит HTTP 000 (бот при этом шлёт
+# нормально, т.к. сам грузит конфиг первым).
+for _c in "$SCRIPT_DIR/tg/tg_bot_config.sh" "$SCRIPT_DIR/tg_bot_config.sh"; do
+    if [ -f "$_c" ]; then source "$_c"; break; fi
+done
+
 # --- Load API helpers (proxy-aware) -----------------------------------------
 # Раньше искался только $SCRIPT_DIR/tg_api_helpers.sh, а файл лежит в tg/ —
 # из-за этого уведомления из MikroGit.sh уходили «мимо» прокси.
@@ -136,10 +144,11 @@ if ! declare -f tg_send_message > /dev/null 2>&1; then
     done
 fi
 
-# --- Load bot config (token/chat_id/пути) ------------------------------------
-for _c in "$SCRIPT_DIR/tg/tg_bot_config.sh" "$SCRIPT_DIR/tg_bot_config.sh"; do
-    if [ -f "$_c" ]; then source "$_c"; break; fi
-done
+# Если хелперы уже были загружены вызывающим скриптом (бот), пропишем прокси
+# из только что прочитанного конфига повторно.
+if declare -f _setup_proxy_env > /dev/null 2>&1; then
+    _setup_proxy_env
+fi
 
 # --- Logging -----------------------------------------------------------------
 # Раньше каждая строка дублировалась в логе: бот запускает скрипт с
@@ -267,9 +276,12 @@ ros_ssh() {
 # Скачать файл с роутера: scp → scp -O (legacy) → sftp.
 # RouterOS отдаёт файлы только при политике ftp; современный OpenSSH по
 # умолчанию использует SFTP-протокол для scp, поэтому нужны варианты.
+# Последняя ошибка scp/sftp (для сообщения пользователю)
+DOWNLOAD_LAST_ERR=""
+
 download_remote_file() {
     # $1 — удалённый путь, $2 — локальный путь
-    local remote="$1" local_dst="$2"
+    local remote="$1" local_dst="$2" err=""
     local -a base=(
         -P "$DEV_PORT" -i "$SSH_KEY"
         -o PubkeyAcceptedAlgorithms=+ssh-rsa
@@ -279,22 +291,26 @@ download_remote_file() {
         -o LogLevel=ERROR
     )
     rm -f "$local_dst"
+    DOWNLOAD_LAST_ERR=""
 
-    scp "${base[@]}" "$DEV_USER@$DEV_IP:$remote" "$local_dst" > /dev/null 2>&1
+    err=$(scp "${base[@]}" "$DEV_USER@$DEV_IP:$remote" "$local_dst" 2>&1 > /dev/null)
     [ -s "$local_dst" ] && return 0
+    [ -n "$err" ] && DOWNLOAD_LAST_ERR="scp: $(printf '%s' "$err" | tr '\n\r' ' ' | cut -c1-160)"
 
     # legacy-протокол (OpenSSH < 9 ведёт себя так и без -O)
-    scp -O "${base[@]}" "$DEV_USER@$DEV_IP:$remote" "$local_dst" > /dev/null 2>&1
+    err=$(scp -O "${base[@]}" "$DEV_USER@$DEV_IP:$remote" "$local_dst" 2>&1 > /dev/null)
     [ -s "$local_dst" ] && return 0
+    [ -n "$err" ] && DOWNLOAD_LAST_ERR="scp -O: $(printf '%s' "$err" | tr '\n\r' ' ' | cut -c1-160)"
 
     # sftp (RouterOS поддерживает на 6.43+/7.x)
     if command -v sftp > /dev/null 2>&1; then
         local batch
         batch=$(mktemp)
         printf 'get %s %s\n' "$remote" "$local_dst" > "$batch"
-        sftp "${base[@]}" -b "$batch" "$DEV_USER@$DEV_IP" > /dev/null 2>&1
+        err=$(sftp "${base[@]}" -b "$batch" "$DEV_USER@$DEV_IP" 2>&1 > /dev/null)
         rm -f "$batch"
         [ -s "$local_dst" ] && return 0
+        [ -n "$err" ] && DOWNLOAD_LAST_ERR="$DOWNLOAD_LAST_ERR sftp: $(printf '%s' "$err" | tr '\n\r' ' ' | cut -c1-160)"
     fi
     rm -f "$local_dst"
     return 1
@@ -417,6 +433,27 @@ ros_remove_file() {
 # Наш ли это файл бэкапа (в имени всегда есть дата: ..._YYYY-MM-DD_HH-MM-SS.backup|.rsc)
 ros_is_our_backup_name() {
     printf '%s' "${1:-}" | grep -Eq '_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}\.(backup|rsc)$'
+}
+
+# Политики SSH-пользователя, короткой строкой: "<группа>|ftp=1 sensitive=0 read=1"
+# (пусто — узнать не удалось; на старых ROS команда может быть недоступна)
+ros_user_policy_flags() {
+    local user="${1:-$DEV_USER}" out
+    [ -n "$user" ] || return 1
+    out=$(ros_ssh ":local u [/user find where name=\"$user\"]; :local g [/user get \$u group]; :local p [/user group get [find where name=\$g] policy]; :local f 0; :local s 0; :local r 0; :foreach x in=\$p do={:if (\$x=\"ftp\") do={:set f 1}; :if (\$x=\"sensitive\") do={:set s 1}; :if (\$x=\"read\") do={:set r 1}}; :put (\$g . \"|ftp=\$f sensitive=\$s read=\$r\")" 30)
+    out=$(printf '%s\n' "$out" | tr -d '\r' | grep -E '\|ftp=[01] sensitive=[01] read=[01]' | tail -1)
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+}
+
+# Текущий список политик группы пользователя ("ssh,read,write,..."), пусто — не узнать
+ros_user_policy_list() {
+    local user="${1:-$DEV_USER}" out
+    [ -n "$user" ] || return 1
+    out=$(ros_ssh ":local u [/user find where name=\"$user\"]; :local g [/user get \$u group]; :put [/user group get [find where name=\$g] policy]" 30)
+    out=$(printf '%s' "$out" | tr -d '\r\n ')
+    case "$out" in ''|*[!a-z,-]*) return 1 ;; esac
+    printf '%s' "$out"
 }
 
 # Время создания из имени файла (epoch); 1 — если даты в имени нет
@@ -664,11 +701,34 @@ backup_device() {
     # Диагностика: файл на роутере есть, но scp не забрал?
     if [ "$downloaded" != "1" ]; then
         if ros_file_exists "${base}.backup"; then
-            local rsize
+            local rsize flags grp="" missing=""
             rsize=$(ros_file_list_tsv | awk -F'\t' -v w="${base}.backup" '$1==w{print $2; exit}')
-            BACKUP_ERROR="файл ${base}.backup есть на роутере ($(human_bytes "$(ros_size_to_bytes "${rsize:-0}")")), но scp/sftp его не скачал — нужна политика ftp у пользователя $DEV_USER"
-            error "$device_name: $BACKUP_ERROR"
-            warning "Пробовали scp, scp -O и sftp. Файл оставлен на роутере: ${base}.backup"
+            flags=$(ros_user_policy_flags "$DEV_USER" 2>/dev/null)
+            if [ -n "$flags" ]; then
+                grp="${flags%%|*}"
+                case "$flags" in *"ftp=0"*)       missing="$missing ftp" ;; esac
+                case "$flags" in *"sensitive=0"*) missing="$missing sensitive" ;; esac
+                case "$flags" in *"read=0"*)      missing="$missing read" ;; esac
+            fi
+            if [ -n "$missing" ]; then
+                BACKUP_ERROR="файл ${base}.backup есть на роутере ($(human_bytes "$(ros_size_to_bytes "${rsize:-0}")")), но scp/sftp не может его забрать: у пользователя $DEV_USER нет политик:$missing${grp:+ (группа $grp)}"
+                error "$device_name: $BACKUP_ERROR"
+                warning "RouterOS не отдаёт .backup по scp/ftp без политики sensitive (и ftp). Winbox: System → Users → Groups → ${grp:-<группа>} → Policy → включите sensitive, ftp, read."
+                local plist fixcmd
+                plist=$(ros_user_policy_list "$DEV_USER" 2>/dev/null || true)
+                if [ -n "$plist" ] && [ -n "$grp" ]; then
+                    case ",$plist," in *,sensitive,*) ;; *) plist="$plist,sensitive" ;; esac
+                    case ",$plist," in *,ftp,*) ;; *) plist="$plist,ftp" ;; esac
+                    fixcmd="/user group set [find name=$grp] policy=$plist"
+                    warning "Исправить (на роутере, от admin): $fixcmd"
+                    info "Пользователь $DEV_USER должен переподключиться (выход/вход по SSH) после смены политик."
+                fi
+            else
+                BACKUP_ERROR="файл ${base}.backup есть на роутере ($(human_bytes "$(ros_size_to_bytes "${rsize:-0}")")), но scp/sftp его не скачал${DOWNLOAD_LAST_ERR:+: $DOWNLOAD_LAST_ERR}"
+                error "$device_name: $BACKUP_ERROR"
+                warning "Пробовали scp, scp -O и sftp. Проверьте политику ftp у $DEV_USER, службу ftp на роутере и SSH-порт."
+            fi
+            warning "Файл оставлен на роутере: ${base}.backup"
             return 1
         fi
         local free_now

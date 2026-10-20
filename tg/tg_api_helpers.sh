@@ -33,7 +33,11 @@ tg_api_log() {
     local level="${1:-}"; shift
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] TG_API [$level]: $*"
     echo "$msg" >&2
-    _tg_log_file_is_stderr || echo "$msg" >> "${LOG_FILE:-/tmp/tg_api.log}" 2>/dev/null
+    if ! _tg_log_file_is_stderr; then
+        local lf="${LOG_FILE:-/tmp/tg_api.log}"
+        [ -d "$(dirname "$lf")" ] || mkdir -p "$(dirname "$lf")" 2>/dev/null || true
+        echo "$msg" >> "$lf" 2>/dev/null || true
+    fi
 }
 
 # ==== CORE API CALL ====

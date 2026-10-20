@@ -376,19 +376,39 @@ bash tg/mk_updates.sh status
 - `write` — `/system package update set/check/download`, `/system backup save`;
 - `test` — сетевые проверки обновления;
 - `reboot` — перезагрузка после установки;
-- `ftp` — **нужен для scp/sftp** — без него бэкап не скачается с роутера.
+- `ftp` — **нужен для scp/sftp** — без него бэкап не скачается с роутера;
+- `sensitive` — **обязателен для `.backup`**: файл содержит пароли, и RouterOS
+  не отдаёт его по scp/ftp без этой политики (симптом: файл на роутере есть,
+  а `scp`/`sftp` его не забирают, в логе `Permission denied`).
 
 ```
-/user group add name=mikrogit policy=ssh,read,write,test,reboot,ftp \
+/user group add name=mikrogit policy=ssh,read,write,test,reboot,ftp,sensitive \
     comment="MikroGit backup + RouterOS update"
 /user set [find name=ИМЯ_ПОЛЬЗОВАТЕЛЯ] group=mikrogit
+```
+
+Если группа уже есть, политики **заменяются** списком — добавьте к текущим
+`ftp` и `sensitive` (иначе `.backup` не скачается):
+
+```
+/user group set [find name=mikrogit] policy=ssh,read,write,test,reboot,ftp,sensitive
+```
+
+После смены политик пользователю нужно переподключиться (выйти/войти по SSH).
+Скрипт сам подскажет эту команду в логе, если увидит, что у пользователя нет
+`sensitive`/`ftp`:
+
+```
+ERROR: AP_U2_Conf: файл ...backup есть на роутере (24 KB), но scp/sftp не может
+его забрать: у пользователя backupUser нет политик: sensitive (группа backup)
+WARNING: Исправить (на роутере, от admin): /user group set [find name=backup] policy=...,sensitive
 ```
 
 ## Частые проблемы
 
 | Симптом | Причина / решение |
 |---|---|
-| `scp` не скачивает `.backup`, файл остаётся на роутере | Нет политики `ftp` у пользователя, либо файл ещё пишется (скрипт повторяет попытки ~15 с) |
+| `scp` не скачивает `.backup`, файл остаётся на роутере | Нет политики `ftp` **или `sensitive`** у пользователя (`.backup` содержит пароли — RouterOS не отдаёт его без `sensitive`). Скрипт определяет это сам и пишет готовую команду `/user group set ... policy=...,ftp,sensitive` |
 | В Telegram «Backup failed!» без причины | Так писала старая версия. Обновите ветку (`git fetch origin && git switch -C arena/38d8b8f6-mkgit origin/arena/38d8b8f6-mkgit`) и перезапустите бота — теперь причина и подсказка приходят в самом сообщении |
 | «файл не появился на роутере» | Мало места на flash. Скрипт сам чистит свои старые бэкапы (старше 30 дней) и повторяет сохранение; если места нет — в логе/Telegram будет причина и список самых больших файлов (см. «Мало места на flash роутера») |
 | Бот не видит бэкапы | `BACKUP_DIR` в `tg_bot_config.sh` не совпадает с каталогом, куда пишет `MikroGit.sh` |
