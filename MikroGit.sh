@@ -61,6 +61,18 @@ BACKUP_CMD_TIMEOUT="${BACKUP_CMD_TIMEOUT:-120}"
 # Сколько ждать освобождения лока (другой бэкап уже идёт), сек
 BACKUP_LOCK_WAIT="${BACKUP_LOCK_WAIT:-900}"
 
+# --- Место на flash роутера ---------------------------------------------------
+# Минимум свободного места, ниже которого считаем, что бэкап может не влезть
+ROUTER_MIN_FREE_BYTES="${ROUTER_MIN_FREE_BYTES:-65536}"
+# Файлы бэкапов НА РОУТЕРЕ старше этого числа дней удаляются, когда мало места
+ROUTER_CLEANUP_DAYS="${ROUTER_CLEANUP_DAYS:-30}"
+# Сколько раз пытаться сохранить бэкап (с уборкой места между попытками)
+ROUTER_SAVE_TRIES="${ROUTER_SAVE_TRIES:-3}"
+# При агрессивной уборке оставлять на роутере самый свежий наш файл
+ROUTER_KEEP_NEWEST="${ROUTER_KEEP_NEWEST:-1}"
+# Сколько секунд ждать появления файла после /system backup save
+ROUTER_FILE_WAIT="${ROUTER_FILE_WAIT:-10}"
+
 # Каталоги создаём лениво (--list не должен ничего писать на диск)
 ensure_dirs() { mkdir -p "$LOG_DIR" "$REPORTS_DIR" "$BACKUP_DIR" 2>/dev/null || true; }
 
@@ -128,10 +140,30 @@ for _c in "$SCRIPT_DIR/tg/tg_bot_config.sh" "$SCRIPT_DIR/tg_bot_config.sh"; do
 done
 
 # --- Logging -----------------------------------------------------------------
-log()     { echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "$LOG_FILE"; }
-error()   { echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1" | tee -a "$LOG_FILE"; }
-warning() { echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1" | tee -a "$LOG_FILE"; }
-info()    { echo -e "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] INFO:${NC} $1" | tee -a "$LOG_FILE"; }
+# Раньше каждая строка дублировалась в логе: бот запускает скрипт с
+# `>> LOG_FILE 2>&1`, и tee писал туда же второй раз. Если stdout уже смотрит
+# в тот же файл — печатаем один раз.
+_LOG_STDOUT_IS_FILE=0
+if [ -n "${LOG_FILE:-}" ] && [ -e /proc/$$/fd/1 ]; then
+    if [ "$(readlink -f /proc/$$/fd/1 2>/dev/null)" = "$(readlink -f "$LOG_FILE" 2>/dev/null)" ]; then
+        _LOG_STDOUT_IS_FILE=1
+    fi
+fi
+emit_log() {
+    if [ "$_LOG_STDOUT_IS_FILE" = "1" ]; then
+        printf '%b\n' "$1"
+        return
+    fi
+    if [ ! -d "$(dirname "$LOG_FILE")" ] && ! mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null; then
+        printf '%b\n' "$1"          # каталога логов нет и создать нельзя
+        return
+    fi
+    printf '%b\n' "$1" | tee -a "$LOG_FILE"
+}
+log()     { emit_log "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"; }
+error()   { emit_log "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1"; }
+warning() { emit_log "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1"; }
+info()    { emit_log "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] INFO:${NC} $1"; }
 
 # --- Telegram notification ---------------------------------------------------
 send_telegram_notification() {
@@ -200,7 +232,13 @@ read_devices() {
 
 # --- SSH helpers -------------------------------------------------------------
 # Глобальные переменные текущего устройства (заполняет backup_device)
-DEV_IP=""; DEV_PORT=""; DEV_USER=""
+DEV_IP=""; DEV_PORT=""; DEV_USER=""; DEV_NAME=""
+# Причина последней неудачи — уходит в Telegram вместе с «Backup failed»
+BACKUP_ERROR=""
+# Локальный файл, скачанный в этом запуске (для отчёта и Telegram)
+LAST_BACKUP_FILE=""
+# Итоги текущего запуска по устройствам: ok/fail, файл, причина
+declare -A RUN_RESULT=() RUN_FILE=() RUN_ERROR=()
 
 ros_ssh() {
     # $1 — команда RouterOS, $2 — таймаут (сек, необязательно)
@@ -259,13 +297,239 @@ download_remote_file() {
 
 # Почему бэкап не удался (по выводу RouterOS/ssh)
 ros_output_is_error() {
-    printf '%s' "${1:-}" | grep -qiE 'failure:|bad command|syntax error|unknown command|invalid|not enough permissions|no such item|denied|cannot'
+    printf '%s' "${1:-}" | grep -qiE 'failure:|bad command|syntax error|unknown command|invalid|not enough permissions|no such item|denied|cannot|no space|not enough free|disk full'
+}
+
+# --- Работа с файлами и местом на роутере -----------------------------------
+# Человеко-читаемый размер из байт
+human_bytes() {
+    local b="${1:-0}"
+    case "$b" in ''|*[!0-9]*) echo "?"; return ;; esac
+    if [ "$b" -ge 1048576 ]; then echo "$(( b / 1048576 )) MB"
+    elif [ "$b" -ge 1024 ]; then echo "$(( b / 1024 )) KB"
+    else echo "$b B"; fi
+}
+
+# "27.4KiB" / "1.2MiB" / "512" -> байты
+ros_size_to_bytes() {
+    local v="${1:-}" num unit
+    v=$(printf '%s' "$v" | tr -d ' \r\t')
+    [ -z "$v" ] && { echo 0; return; }
+    num=$(printf '%s' "$v" | sed -E 's/^([0-9]+([.][0-9]+)?).*/\1/')
+    unit=$(printf '%s' "$v" | sed -E 's/^[0-9]+([.][0-9]+)?//' | tr '[:upper:]' '[:lower:]')
+    awk -v n="${num:-0}" -v u="$unit" 'BEGIN {
+        m = 1
+        if (u ~ /^k/) m = 1024
+        else if (u ~ /^m/) m = 1048576
+        else if (u ~ /^g/) m = 1073741824
+        printf "%.0f\n", n * m
+    }'
+}
+
+# Свободно на flash, байт (пусто, если прочитать не удалось)
+ros_free_bytes() {
+    local out val
+    out=$(ros_ssh "/system resource print" 30)
+    val=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*free-hdd-space:[[:space:]]*//p' | head -1)
+    [ -z "$val" ] && { printf ''; return; }
+    ros_size_to_bytes "$val"
+}
+
+# Всего на flash, байт
+ros_total_bytes() {
+    local out val
+    out=$(ros_ssh "/system resource print" 30)
+    val=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*total-hdd-space:[[:space:]]*//p' | head -1)
+    [ -z "$val" ] && { printf ''; return; }
+    ros_size_to_bytes "$val"
+}
+
+# Список файлов роутера: NAME<TAB>SIZE_BYTES
+ros_file_list_tsv() {
+    local out
+    out=$(ros_ssh ':foreach f in=[/file find] do={:put ([/file get $f name] . "|" . [/file get $f size])}' 60)
+    out=$(printf '%s\n' "$out" | tr -d '\r')
+    if printf '%s' "$out" | grep -q '|'; then
+        printf '%s\n' "$out" | awk -F'|' 'NF>=2 && $1!="" {print $1"\t"$2}'
+        return 0
+    fi
+    # Fallback: обычный /file print
+    out=$(ros_ssh "/file print" 60)
+    printf '%s\n' "$out" | tr -d '\r' | awk '
+        /^[[:space:]]*[0-9]+[[:space:]]/ {
+            name = $2
+            size = "0"
+            for (i = 3; i <= NF; i++) {
+                if ($i ~ /^[0-9.]+(B|KiB|MiB|GiB)$/) { size = $i; break }
+            }
+            print name "\t" size
+        }'
+}
+
+# Файл с таким именем есть на роутере?
+ros_file_exists() {
+    local want="$1" list
+    list=$(ros_file_list_tsv)
+    if [ -n "$list" ]; then
+        printf '%s\n' "$list" | awk -F'\t' -v w="$want" '$1 == w {found=1} END {exit !found}'
+        return
+    fi
+    # Список не получили (или на роутере нет файлов) — спрашиваем точечно
+    ros_ssh "/file print where name=\"$want\"" 30 | grep -qF "$want"
+}
+
+# Грубая проверка: имя встречается в полном /file print
+# (на случай, если :foreach и «where name=» на этом RouterOS не сработали)
+ros_file_exists_loose() {
+    local want="$1"
+    [ -n "$want" ] || return 1
+    ros_ssh "/file print" 30 | grep -qF "$want"
+}
+
+# Ждать появления файла (роутер пишет на flash не мгновенно)
+ros_wait_file() {
+    local want="$1" secs="${2:-$ROUTER_FILE_WAIT}" i
+    for ((i = 0; i <= secs; i++)); do
+        ros_file_exists "$want" && return 0
+        [ "$i" -lt "$secs" ] && sleep 1
+    done
+    return 1
+}
+
+# Удалить файл на роутере
+ros_remove_file() {
+    local name="$1"
+    [ -n "$name" ] || return 1
+    local out
+    out=$(ros_ssh "/file remove [find name=\"$name\"]" 30)
+    if ros_output_is_error "$out"; then
+        warning "не удалось удалить $name с роутера: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+        return 1
+    fi
+    return 0
+}
+
+# Наш ли это файл бэкапа (в имени всегда есть дата: ..._YYYY-MM-DD_HH-MM-SS.backup|.rsc)
+ros_is_our_backup_name() {
+    printf '%s' "${1:-}" | grep -Eq '_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}\.(backup|rsc)$'
+}
+
+# Время создания из имени файла (epoch); 1 — если даты в имени нет
+ros_name_epoch() {
+    local n base
+    n="$(basename "${1:-}")"
+    base=$(printf '%s' "$n" | sed -nE 's/.*_([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})-([0-9]{2})-([0-9]{2})\.(backup|rsc)$/\1 \2:\3:\4/p')
+    [ -z "$base" ] && return 1
+    date -d "$base" +%s 2>/dev/null || return 1
+}
+
+# Освободить flash роутера: удалить НАШИ старые бэкапы/экспорты.
+#   $1 — возраст в днях (30: только старше; 0: любые, от самых старых)
+#   $2 — сколько байт надо освободить (0: удалить все подходящие)
+#   $3 — максимум файлов к удалению (0: без ограничения)
+# Ставит ROS_CLEANED_BYTES; rc=0, если что-то удалили.
+ROS_CLEANED_BYTES=0
+ros_cleanup_old_backups() {
+    local days="${1:-$ROUTER_CLEANUP_DAYS}" need="${2:-0}" maxdel="${3:-0}"
+    local now list name size epoch age_days total=0 n=0
+    local -a cand=()
+    ROS_CLEANED_BYTES=0
+    now=$(date +%s)
+    list=$(ros_file_list_tsv) || return 1
+    [ -n "$list" ] || return 1
+
+    while IFS=$'\t' read -r name size; do
+        [ -n "$name" ] || continue
+        ros_is_our_backup_name "$name" || continue
+        epoch=$(ros_name_epoch "$name") || epoch=""
+        if [ -n "$epoch" ]; then
+            age_days=$(( (now - epoch) / 86400 ))
+            [ "$days" -gt 0 ] && [ "$age_days" -lt "$days" ] && continue
+            cand+=("$epoch|$name|$(ros_size_to_bytes "$size")")
+        else
+            # без даты в имени удаляем только при агрессивной уборке (days=0)
+            [ "$days" -eq 0 ] && cand+=("0|$name|$(ros_size_to_bytes "$size")")
+        fi
+    done <<< "$list"
+
+    [ ${#cand[@]} -eq 0 ] && return 1
+
+    # самые старые первыми
+    local -a sorted=()
+    while IFS= read -r line; do sorted+=("$line"); done < <(printf '%s\n' "${cand[@]}" | sort -t'|' -k1,1n)
+
+    # Не трогаем самый свежий наш файл (страховка на случай отката),
+    # но если его удаление — единственный способ освободить место, удалим и его.
+    # В режиме «старше N дней» (days>0) удаляем всё подходящее: это старьё.
+    # Страховка-«последний файл» нужна только при агрессивной уборке (days=0).
+    local held=""
+    if [ "$days" -eq 0 ] && [ "${ROUTER_KEEP_NEWEST:-1}" = "1" ] && [ ${#sorted[@]} -gt 1 ]; then
+        held="${sorted[$((${#sorted[@]} - 1))]}"
+        sorted=("${sorted[@]:0:$((${#sorted[@]} - 1))}")
+    fi
+
+    local entry
+    for entry in "${sorted[@]}"; do
+        name="${entry#*|}"; name="${name%|*}"
+        size="${entry##*|}"
+        [ -n "$name" ] || continue
+        if ros_remove_file "$name"; then
+            total=$((total + size)); n=$((n + 1))
+            info "  удалён с роутера: $name ($(human_bytes "$size"))"
+        fi
+        [ "$maxdel" -gt 0 ] && [ "$n" -ge "$maxdel" ] && break
+        [ "$need" -gt 0 ] && [ "$total" -ge "$need" ] && break
+    done
+
+    # всё ещё мало места? тогда жертвуем и самым свежим нашим файлом
+    if [ -n "$held" ] && { [ "$need" -eq 0 ] || [ "$total" -lt "$need" ]; }; then
+        name="${held#*|}"; name="${name%|*}"; size="${held##*|}"
+        if [ -n "$name" ] && ros_remove_file "$name"; then
+            total=$((total + size)); n=$((n + 1))
+            info "  удалён с роутера: $name ($(human_bytes "$size")) — единственный способ освободить место"
+        fi
+    fi
+
+    # RouterOS обновляет список файлов не мгновенно — даём ему секунду
+    [ "$n" -gt 0 ] && sleep 1
+    ROS_CLEANED_BYTES=$total
+    if [ "$n" -gt 0 ]; then
+        log "Очистка роутера: удалено файлов $n, освобождено $(human_bytes "$total")"
+        return 0
+    fi
+    return 1
+}
+
+# Убедиться, что на flash достаточно места (при нехватке — чистим старое)
+# $1 — сколько байт нужно
+ros_ensure_space() {
+    local need="${1:-$ROUTER_MIN_FREE_BYTES}" free
+    free=$(ros_free_bytes)
+    [ -z "$free" ] && return 0     # не смогли прочитать — не мешаем работать
+    info "Свободно на flash: $(human_bytes "$free") (нужно ~$(human_bytes "$need"))"
+    if [ "$free" -ge "$need" ]; then
+        return 0
+    fi
+    warning "$DEV_NAME: мало места ($(human_bytes "$free") < $(human_bytes "$need")) — удаляю старые бэкапы с роутера (старше $ROUTER_CLEANUP_DAYS дней)"
+    ros_cleanup_old_backups "$ROUTER_CLEANUP_DAYS" $((need - free)) 0 || true
+    sleep 1
+    free=$(ros_free_bytes)
+    if [ -n "$free" ] && [ "$free" -lt "$need" ]; then
+        warning "$DEV_NAME: после удаления старше $ROUTER_CLEANUP_DAYS дней всё ещё мало ($(human_bytes "$free")) — удаляю самые старые из наших бэкапов"
+        ros_cleanup_old_backups 0 $((need - free)) 0 || true
+        free=$(ros_free_bytes)
+        [ -n "$free" ] && info "Свободно после очистки: $(human_bytes "$free")"
+    fi
+    return 0
 }
 
 # --- Backup a single device --------------------------------------------------
 backup_device() {
     local device_name=$1
     DEV_IP=$2; DEV_PORT=$3; DEV_USER=$4
+    DEV_NAME=$device_name
+    BACKUP_ERROR=""
+    LAST_BACKUP_FILE=""
     local description=$5
     local timestamp; timestamp=$(date +%Y-%m-%d_%H-%M-%S)
     local prefix=""
@@ -285,6 +549,7 @@ backup_device() {
     local out
     out=$(ros_ssh "/system identity print" 30)
     if ros_output_is_error "$out" || [ -z "$out" ]; then
+        BACKUP_ERROR="нет SSH-доступа к $DEV_IP:$DEV_PORT: $(printf '%s' "$out" | tail -2 | tr '\n' ' ' | cut -c1-160)"
         error "Cannot connect to $device_name ($DEV_IP:$DEV_PORT): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')"
         return 1
     fi
@@ -294,19 +559,83 @@ backup_device() {
     version=$(printf '%s\n' "$out" | sed -n 's/^\s*version:\s*//p' | head -1)
     info "Identity: ${identity:-?}, Version: ${version:-?}"
 
-    # --- Создаём резервную копию (.backup) на самом роутере ------------------
-    info "Creating .backup on $device_name..."
-    out=$(ros_ssh "/system backup save name=$base dont-encrypt=yes" "$BACKUP_CMD_TIMEOUT")
-    if ros_output_is_error "$out"; then
-        # Старые RouterOS (до 6.43) не знают dont-encrypt — повторяем без него
-        warning "dont-encrypt не принят роутером ($(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)) — повтор без него"
-        out=$(ros_ssh "/system backup save name=$base" "$BACKUP_CMD_TIMEOUT")
+    # --- Проверяем место на flash и при нехватке чистим старое ----------------
+    local need_bytes=$ROUTER_MIN_FREE_BYTES prev_size=0 prev
+    prev=$(bkl_latest "$device_backup_dir" regular 2>/dev/null | head -1)
+    [ -n "$prev" ] && [ -f "$prev" ] && prev_size=$(stat -c%s "$prev" 2>/dev/null || echo 0)
+    if [ "$prev_size" -gt 0 ]; then
+        need_bytes=$(( prev_size * 2 + 32768 ))
+    elif [ "$ROUTER_MIN_FREE_BYTES" -lt 262144 ]; then
+        need_bytes=262144        # первый бэкап: ~170-200 KB + запас
     fi
-    if ros_output_is_error "$out"; then
-        error "Не удалось создать резервную копию на $device_name: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
-        ros_ssh "/file remove [find where name=\"${base}.backup\"]" 30 > /dev/null 2>&1
+    ros_ensure_space "$need_bytes"
+
+    # --- Создаём резервную копию (.backup) с повторами -----------------------
+    # На AP с маленьким flash бэкап может не создаться молча (нет места,
+    # остались файлы от прошлых запусков). Тогда чистим старое и пробуем снова.
+    local attempt out save_err="" saved=0
+    for ((attempt = 1; attempt <= ROUTER_SAVE_TRIES; attempt++)); do
+        info "Creating .backup on $device_name (попытка $attempt/$ROUTER_SAVE_TRIES)..."
+        out=$(ros_ssh "/system backup save name=$base dont-encrypt=yes" "$BACKUP_CMD_TIMEOUT")
+        if ros_output_is_error "$out" && printf '%s' "$out" | grep -qiE 'dont-encrypt|bad command|syntax error|unknown'; then
+            # Старые RouterOS (до 6.43) не знают dont-encrypt — повторяем без него
+            warning "dont-encrypt не принят роутером ($(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)) — повтор без него"
+            out=$(ros_ssh "/system backup save name=$base" "$BACKUP_CMD_TIMEOUT")
+        fi
+        save_err="$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+
+        if ros_wait_file "${base}.backup" "$ROUTER_FILE_WAIT"; then
+            saved=1
+            break
+        fi
+        # список файлов мог не прочитаться — проверяем по полному /file print
+        if ros_file_exists_loose "${base}.backup"; then
+            saved=1
+            break
+        fi
+
+        # файла нет — разбираемся почему и освобождаем место
+        ros_remove_file "${base}.backup" > /dev/null 2>&1   # недописанный огрызок
+        local free_now; free_now=$(ros_free_bytes)
+        warning "$DEV_NAME: файл ${base}.backup не появился${save_err:+ (ответ роутера: $save_err)}; свободно $(human_bytes "${free_now:-?}")"
+        [ "$attempt" -lt "$ROUTER_SAVE_TRIES" ] || break
+
+        local before="${free_now:-0}" after
+        if ! ros_cleanup_old_backups "$ROUTER_CLEANUP_DAYS" 0 0; then
+            warning "$DEV_NAME: наших бэкапов старше $ROUTER_CLEANUP_DAYS дней нет — удаляю самые старые из наших"
+            ros_cleanup_old_backups 0 "$need_bytes" 0 || true
+        fi
+        after=$(ros_free_bytes); after="${after:-0}"
+        if [ "$after" -le "$before" ]; then
+            # чистить нечего: flash занят чем-то посторонним
+            warning "$DEV_NAME: на роутере нечего удалять — старых файлов наших бэкапов нет."
+            local tops
+            tops=$(ros_file_list_tsv | awk -F'\t' '{printf "%s\t%s\n", $2, $1}' | sort -rn | head -5 | \
+                   awk -F'\t' '{ sz=$1+0
+                                 if (sz >= 1048576) h=sprintf("%.1f MB", sz/1048576)
+                                 else if (sz >= 1024) h=sprintf("%.0f KB", sz/1024)
+                                 else h=sz" B"
+                                 printf "%s%s (%s)", (NR>1?", ":""), $2, h }')
+            [ -n "$tops" ] && warning "$DEV_NAME: самые большие файлы на flash: $tops"
+            warning "$DEV_NAME: освободите место вручную (/file print; /file remove [find name=...]) или подключите USB/увеличьте flash."
+            break
+        fi
+        info "Свободно после очистки: $(human_bytes "$after")"
+    done
+
+    if [ "$saved" != "1" ] && ros_file_exists_loose "${base}.backup"; then
+        saved=1      # файл всё-таки есть, просто список файлов не читался
+    fi
+    if [ "$saved" != "1" ]; then
+        local free_now total
+        free_now=$(ros_free_bytes); total=$(ros_total_bytes)
+        BACKUP_ERROR="на роутере не создаётся ${base}.backup (свободно $(human_bytes "${free_now:-?}") из $(human_bytes "${total:-?}"))${save_err:+; ответ: $save_err}"
+        error "$DEV_NAME: не удалось создать резервную копию: $BACKUP_ERROR"
+        error "Что проверить: /system resource print (free-hdd-space), /file print; удалите лишние файлы на flash."
+        ros_remove_file "${base}.backup" > /dev/null 2>&1
         return 1
     fi
+    LAST_BACKUP_FILE="$local_file"
     log "Резервная копия создана на роутере: ${base}.backup"
 
     # --- Скачиваем (роутер пишет файл на flash — с повторами) ----------------
@@ -329,17 +658,19 @@ backup_device() {
 
     # Диагностика: файл на роутере есть, но scp не забрал?
     if [ "$downloaded" != "1" ]; then
-        local listing
-        listing=$(ros_ssh "/file print where name=\"${base}.backup\"" 30)
-        if [ -z "$(printf '%s' "$listing" | grep -F "${base}.backup")" ]; then
-            error "$device_name: файл ${base}.backup не появился на роутере (мало места на flash?)"
-        else
-            error "$device_name: файл ${base}.backup есть на роутере, но scp не смог его скачать."
-            warning "Проверьте политику ftp у пользователя $DEV_USER (scp/sftp в RouterOS требует её) и SSH-порт. Пробовали scp, scp -O и sftp."
-            warning "Файл оставлен на роутере: ${base}.backup"
+        if ros_file_exists "${base}.backup"; then
+            local rsize
+            rsize=$(ros_file_list_tsv | awk -F'\t' -v w="${base}.backup" '$1==w{print $2; exit}')
+            BACKUP_ERROR="файл ${base}.backup есть на роутере ($(human_bytes "$(ros_size_to_bytes "${rsize:-0}")")), но scp/sftp его не скачал — нужна политика ftp у пользователя $DEV_USER"
+            error "$device_name: $BACKUP_ERROR"
+            warning "Пробовали scp, scp -O и sftp. Файл оставлен на роутере: ${base}.backup"
             return 1
         fi
-        ros_ssh "/file remove [find where name=\"${base}.backup\"]" 30 > /dev/null 2>&1
+        local free_now
+        free_now=$(ros_free_bytes)
+        BACKUP_ERROR="файл ${base}.backup не появился на роутере (свободно $(human_bytes "${free_now:-?}"))"
+        error "$device_name: $BACKUP_ERROR"
+        ros_remove_file "${base}.backup" > /dev/null 2>&1
         return 1
     fi
 
@@ -347,10 +678,7 @@ backup_device() {
     log "Backup downloaded: $(basename "$local_file") ($(bkl_size_h "$local_file"), $(bkl_label "$local_file"))"
 
     # --- Убираем временный файл с роутера (не забиваем flash) ----------------
-    out=$(ros_ssh "/file remove [find where name=\"${base}.backup\"]" 30)
-    if ros_output_is_error "$out"; then
-        warning "Не удалось удалить ${base}.backup с роутера: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
-    else
+    if ros_remove_file "${base}.backup"; then
         info "Временный файл на роутере удалён"
     fi
 
@@ -432,13 +760,19 @@ Backup format: .backup (/system backup save dont-encrypt=yes)
 Device Details:
 EOF
 
-    local device name ip port user description dir latest pre
+    local device name ip port user description dir latest pre res
     for device in "${DEVICES_ARRAY[@]}"; do
         IFS=':' read -r name ip port user description <<< "$device"
         dir="$BACKUP_DIR/$name"
         latest=$(bkl_latest "$dir" regular)
         pre=$(bkl_latest "$dir" pre)
-        if [ -n "$latest" ]; then
+        res="${RUN_RESULT[$name]:-}"
+        if [ "$res" = "fail" ]; then
+            # в этом запуске копию сделать не удалось — не выдаём старую за свежую
+            printf '✗ %s (%s): FAILED%s\n' "$name" "$description" "${RUN_ERROR[$name]:+ — ${RUN_ERROR[$name]}}" >> "$report_file"
+        elif [ "$res" = "ok" ] && [ -n "${RUN_FILE[$name]:-}" ]; then
+            printf '✓ %s (%s): %s [%s]\n' "$name" "$description" "$(basename "${RUN_FILE[$name]}")" "$(bkl_size_h "${RUN_FILE[$name]}")" >> "$report_file"
+        elif [ -n "$latest" ]; then
             printf '✓ %s (%s): %s [%s]\n' "$name" "$description" "$(basename "$latest")" "$(bkl_size_h "$latest")" >> "$report_file"
         else
             echo "✗ $name ($description): NO BACKUP" >> "$report_file"
@@ -541,20 +875,28 @@ main() {
 
     local success_count=0 fail_count=0 total_devices=${#DEVICES_ARRAY[@]}
     local device name ip port user description
+    RUN_RESULT=(); RUN_FILE=(); RUN_ERROR=()   # см. declare -A выше
 
     for device in "${DEVICES_ARRAY[@]}"; do
         IFS=':' read -r name ip port user description <<< "$device"
         if backup_device "$name" "$ip" "$port" "$user" "$description"; then
             ((success_count++))
-            local lst
-            lst=$(bkl_latest "$BACKUP_DIR/$name" all)
+            RUN_RESULT[$name]="ok"
+            RUN_FILE[$name]="$LAST_BACKUP_FILE"
             if [ -n "$TELEGRAM_NOTIFICATION" ]; then
-                send_telegram_notification "✅ <b>Backup OK!</b>\nDevice: <b>$name</b>\nFile: <code>$(basename "${lst:-?}")</code>\nWhere: <code>$BACKUP_DIR/$name/</code>"
+                send_telegram_notification "✅ <b>Backup OK!</b>\nDevice: <b>$name</b>\nFile: <code>$(basename "${LAST_BACKUP_FILE:-?}")</code>\nWhere: <code>$BACKUP_DIR/$name/</code>"
             fi
         else
             ((fail_count++))
-            [ -n "$TELEGRAM_NOTIFICATION" ] && \
-                send_telegram_notification "❌ <b>Backup failed!</b>\nDevice: $name\nCheck logs: <code>$LOG_FILE</code>"
+            RUN_RESULT[$name]="fail"
+            RUN_ERROR[$name]="${BACKUP_ERROR:-(см. лог)}"
+            if [ -n "$TELEGRAM_NOTIFICATION" ]; then
+                if [ -n "${BACKUP_ERROR:-}" ]; then
+                    send_telegram_notification "❌ <b>Backup failed!</b>\nDevice: <b>$name</b>\nПричина: $BACKUP_ERROR\nЛог: <code>$LOG_FILE</code>"
+                else
+                    send_telegram_notification "❌ <b>Backup failed!</b>\nDevice: $name\nCheck logs: <code>$LOG_FILE</code>"
+                fi
+            fi
         fi
         echo "----------------------------------------"
     done

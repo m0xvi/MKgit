@@ -22,11 +22,18 @@ TG_RETRY_DELAY="${TG_RETRY_DELAY:-2}"
 TG_TIMEOUT="${TG_TIMEOUT:-30}"
 
 # --- Logging (stderr) ---
+# Если stderr уже перенаправлен в LOG_FILE (бот запускает скрипт как
+# `>> LOG_FILE 2>&1`), вторую запись не делаем — иначе строки дублируются.
+_tg_log_file_is_stderr() {
+    local lf="${LOG_FILE:-}"
+    [ -n "$lf" ] && [ -f "$lf" ] && [ -e /proc/$$/fd/2 ] || return 1
+    [ "$(readlink -f "$lf" 2>/dev/null)" = "$(readlink -f /proc/$$/fd/2 2>/dev/null)" ]
+}
 tg_api_log() {
     local level="${1:-}"; shift
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] TG_API [$level]: $*"
     echo "$msg" >&2
-    echo "$msg" >> "${LOG_FILE:-/tmp/tg_api.log}"
+    _tg_log_file_is_stderr || echo "$msg" >> "${LOG_FILE:-/tmp/tg_api.log}" 2>/dev/null
 }
 
 # ==== CORE API CALL ====
