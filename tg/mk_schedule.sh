@@ -152,7 +152,7 @@ msch_plan_text() {
     lu=$(date -d "@${SCHED_LAST_UPDATE:-0}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "—")
     t+="\n🕐 Последний бэкап: $([ "${SCHED_LAST_BACKUP:-0}" = "0" ] && echo 'ещё не запускался' || echo "$lb")"
     t+="\n🕐 Последняя проверка обновлений: $([ "${SCHED_LAST_UPDATE:-0}" = "0" ] && echo 'ещё не запускалась' || echo "$lu")"
-    printf '%b' "$t"
+    printf '%b\n' "$t"
 }
 
 # --- Живой ли демон ----------------------------------------------------------
@@ -187,7 +187,7 @@ source "$MSCH_SELF_DIR/mk_schedule.sh"
 msch_log "демон запущен (pid=\$\$)"
 while true; do
     msch_tick || true
-    sleep $MSCH_POLL
+    sleep $MSCH_POLL & wait \$! 2>/dev/null || true
 done
 DEOF
 }
@@ -305,9 +305,32 @@ msch_main() {
         status)
             msch_load
             if msch_daemon_running; then echo "демон: ✅ работает (pid=$(msch_daemon_pid))"; else echo "демон: ⛔ не запущен"; fi
+            echo "🗓 Расписание MikroGit:"
             msch_plan_text | sed 's/<[^>]*>//g'
             ;;
         tick)    msch_tick ;;
+        daemon)
+            # Foreground-цикл для systemd (Type=simple): демон не отвязывается
+            # от терминала, systemd сам его перезапускает при падении.
+            msch_ensure_dirs
+            if command -v flock > /dev/null 2>&1; then
+                exec 9> "$(msch_state_dir)/daemon.lock"
+                if ! flock -n 9; then
+                    echo "Планировщик уже запущен (lock занят) — выходим." >&2
+                    exit 0
+                fi
+            fi
+            echo "$$" > "$(msch_pid_file)"
+            trap 'rm -f "$(msch_pid_file)"; exit 0' TERM INT
+            msch_log "демон (systemd/foreground) запущен pid=$$"
+            while true; do
+                msch_tick || true
+                # sleep в фоне + wait: TERM от systemd обрабатывается сразу,
+                # а не после окончания паузы (иначе stop висит до 30 c,
+                # systemd добивает по TimeoutStopSec и остаётся stale pid)
+                sleep "$MSCH_POLL" & wait $! 2>/dev/null || true
+            done
+            ;;
         run)
             # немедленный прогон выбранного блока: run backup | run updates
             case "${2:-}" in
@@ -316,7 +339,7 @@ msch_main() {
                 *) echo "Использование: mk_schedule.sh run {backup|updates}" >&2; exit 2 ;;
             esac ;;
         *)
-            echo "Использование: mk_schedule.sh {start|stop|status|tick|run backup|run updates}" >&2
+            echo "Использование: mk_schedule.sh {start|stop|status|daemon|tick|run backup|run updates}" >&2
             exit 2 ;;
     esac
 }

@@ -93,26 +93,51 @@ bash tg/mk_schedule.sh run updates   # проверка/обновление н�
 
 ### systemd (бот + расписание после перезагрузки)
 
-```ini
-# /etc/systemd/system/mkgit-bot.service
-[Unit]
-Description=MikroGit Telegram bot
-After=network-online.target
+В репозитории есть готовые юниты:
 
-[Service]
-Type=simple
-User=aionis
-WorkingDirectory=/home/aionis/MikroGit/tg
-ExecStart=/home/aionis/MKgit/tg/start_bot_with_ssh.sh
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo cp tg/mkgit-bot.service.example      /etc/systemd/system/mkgit-bot.service
+sudo cp tg/mkgit-schedule.service.example /etc/systemd/system/mkgit-schedule.service
+# поправьте в них User=/пути, если у вас другой пользователь/каталог
+sudo systemctl daemon-reload
+sudo systemctl enable --now mkgit-bot mkgit-schedule
+sudo systemctl status mkgit-bot mkgit-schedule
 ```
 
-Демон расписания запускается ботом и живёт отдельно, поэтому при
-перезапуске бота расписание не сбивается. Альтернатива — cron:
+- `mkgit-bot` — Telegram-бот;
+- `mkgit-schedule` — планировщик (ежедневный бэкап + недельные обновления).
+  Он живёт **отдельно** от бота, поэтому расписание не сбивается при
+  перезапуске бота; если он запущен через systemd, бот при старте его не
+  дублирует (защита через `flock`).
+
+### ⚠️ Не запускайте от root
+
+Бот и планировщик должны работать от **владельца каталога репозитория**
+(обычно `aionis`). Если запустить от `root`:
+
+- `HOME=/root`, поэтому SSH-ключ ищется в `/root/.ssh/mk_key` — его там нет;
+- логи, `bckp/` и lock-файлы создаются root-овыми, и после этого обычный
+  пользователь не может ни писать в лог, ни снять lock («Бот уже запущен»).
+
+`start_bot_with_ssh.sh` теперь сам определяет владельца репозитория и
+перезапускается от него. Если нужно поправить права вручную:
+
+```bash
+sudo chown -R aionis:aionis /home/aionis/MikroGit
+```
+
+### Если бот не стартует: «Бот уже запущен (lock занят)»
+
+```bash
+pgrep -af mk_tg_bot.sh          # какие копии работают
+pkill -f mk_tg_bot.sh           # остановить все (или tmux kill-session -t mkgit)
+sudo lsof /home/aionis/MikroGit/logs/mk_tg_bot.lock   # если процессов не видно
+```
+
+Затем запустите **один** экземпляр: `systemctl start mkgit-bot` **или**
+`./start_bot_with_ssh.sh` (не оба сразу).
+
+### Альтернатива systemd — cron
 
 ```
 0 3 * * *  /home/USER/MKgit/MikroGit.sh --telegram schedule >> /home/USER/MKgit/logs/mk_backup.log 2>&1
@@ -256,6 +281,9 @@ bash tg/mk_updates.sh status
 | Бот не видит бэкапы | `BACKUP_DIR` в `tg_bot_config.sh` не совпадает с каталогом, куда пишет `MikroGit.sh` |
 | Устройство висит в статусе «нет бэкапов» | Раньше папки создавались пустыми из-за `.rsc.rsc`; теперь пустые каталоги чистятся, а бэкап проверяется по размеру |
 | Расписание не срабатывает | `bash tg/mk_schedule.sh status` — демон запущен? Проверьте время сервера/часовой пояс |
+| `No such file or directory` при `bash tg/mk_schedule.sh` | Команда запускается из каталога `tg/` — используйте `bash mk_schedule.sh status` или `bash tg/mk_schedule.sh status` из корня проекта |
+| `Unit mkgit-bot.service not found` | Юнит не установлен: `sudo cp tg/mkgit-bot.service.example /etc/systemd/system/mkgit-bot.service && sudo systemctl daemon-reload` |
+| Бот стартует, но бэкапы падают с «Cannot connect» | Бот запущен от root → ключ ищется в `/root/.ssh`. Запускайте от `aionis` (см. «Не запускайте от root») |
 | Бэкапы «перед обновлением» пропали | Проверьте `MAX_PRE_UPDATE_BACKUPS`: они ротируются отдельно от плановых |
 
 ## Важные замечания

@@ -103,6 +103,16 @@ error() { echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1"; echo "[
 # вторая копия при старте видит занятый lock и сразу завершается.
 BOT_LOCK_FILE="$(dirname "$LOG_FILE")/mk_tg_bot.lock"
 
+# Кто держит лок: печатаем живые процессы бота (pid, пользователь, время работы)
+bot_lock_holders() {
+    local p info
+    for p in $(pgrep -f 'mk_tg_bot\.sh' 2>/dev/null || true); do
+        [ "$p" = "$$" ] && continue
+        info=$(ps -o pid=,user=,etime=,args= -p "$p" 2>/dev/null | sed 's/^[[:space:]]*//' | cut -c1-110)
+        [ -n "$info" ] && echo "  • $info"
+    done
+}
+
 ensure_single_instance() {
     mkdir -p "$(dirname "$BOT_LOCK_FILE")" 2>/dev/null || true
     if command -v flock > /dev/null 2>&1; then
@@ -110,7 +120,17 @@ ensure_single_instance() {
         # при выходе процесса ядро само снимает блокировку.
         exec 9> "$BOT_LOCK_FILE"
         if ! flock -n 9; then
-            error "Бот уже запущен (lock занят: $BOT_LOCK_FILE). Остановите старый процесс и запустите бота один раз (systemd ИЛИ start_bot_with_ssh.sh)."
+            error "Бот уже запущен — лок занят: $BOT_LOCK_FILE"
+            local holders; holders=$(bot_lock_holders)
+            if [ -n "$holders" ]; then
+                error "Процессы бота, которые его держат:"
+                printf '%s\n' "$holders" >&2
+                error "Остановите их:  pkill -f mk_tg_bot.sh   (или tmux kill-session -t <имя>)"
+                error "Затем запустите ОДИН экземпляр: systemctl restart mkgit-bot | ./start_bot_with_ssh.sh"
+            else
+                error "Живых процессов mk_tg_bot.sh не видно — вероятно, лок держит процесс другого пользователя (root?)."
+                error "Проверьте: sudo lsof $BOT_LOCK_FILE   |   sudo fuser -v $BOT_LOCK_FILE"
+            fi
             exit 1
         fi
         echo "$$" >&9
@@ -1760,7 +1780,13 @@ run_bot() {
 
     # Планировщик (бэкап/обновления по расписанию) живёт отдельным демоном:
     # поднимаем его при старте бота, чтобы расписание работало и после ребута.
-    if declare -f msch_daemon_ensure > /dev/null 2>&1; then
+    # Если планировщик запущен через systemd (mkgit-schedule.service) — не
+    # трогаем его: там свой процесс и свой контроль.
+    if [ "$(id -u)" = "0" ]; then
+        log "Бот запущен от root — планировщик не поднимаю (логи/локи станут root-овыми)."
+    elif systemctl is-active --quiet mkgit-schedule 2>/dev/null; then
+        log "Планировщик управляется systemd (mkgit-schedule) — оставляю как есть."
+    elif declare -f msch_daemon_ensure > /dev/null 2>&1; then
         if msch_daemon_ensure; then
             log "Планировщик запущен/уже работает (pid=$(msch_daemon_pid 2>/dev/null))"
         else
