@@ -126,6 +126,32 @@ sudo systemctl status mkgit-bot mkgit-schedule
 sudo chown -R aionis:aionis /home/aionis/MikroGit
 ```
 
+### Диагностика одной командой
+
+```bash
+bash tg/mkgit_doctor.sh            # проверить всё (ничего не меняет)
+sudo bash tg/mkgit_doctor.sh --fix # + исправить владельца файлов
+```
+
+Проверяет: владельца файлов (root-овые → `dubious ownership` /
+`Permission denied` в `.git`), права на `logs/`, `bckp/`, `.git`, SSH-ключ,
+процессы бота и зависшие локи, systemd-юниты, мусор в `~`, состояние бэкапов
+и расписания. Код возврата: `0` — всё ок, `1` — замечания, `2` — ошибки.
+
+### Если git пишет «dubious ownership» или «Permission denied» в .git
+
+Причина одна: команды git выполнялись от `root` (через `sudo su`), и файлы
+`.git` стали root-овыми. Лечится владельцем, а не `safe.directory`:
+
+```bash
+sudo chown -R aionis:aionis /home/aionis/MikroGit
+```
+
+> `git config --global --add safe.directory …` — это костыль: git начнёт
+> доверять каталогу, но запись в `.git/FETCH_HEAD` всё равно останется
+> запрещённой (`Permission denied`). Если уже добавляли — уберите:
+> `git config --global --unset-all safe.directory`
+
 ### Если бот не стартует: «Бот уже запущен (lock занят)»
 
 ```bash
@@ -282,6 +308,7 @@ bash tg/mk_updates.sh status
 | Устройство висит в статусе «нет бэкапов» | Раньше папки создавались пустыми из-за `.rsc.rsc`; теперь пустые каталоги чистятся, а бэкап проверяется по размеру |
 | Расписание не срабатывает | `bash tg/mk_schedule.sh status` — демон запущен? Проверьте время сервера/часовой пояс |
 | `No such file or directory` при `bash tg/mk_schedule.sh` | Команда запускается из каталога `tg/` — используйте `bash mk_schedule.sh status` или `bash tg/mk_schedule.sh status` из корня проекта |
+| git: `dubious ownership` / `cannot open .git/FETCH_HEAD: Permission denied` | Репозиторием владеет root после `sudo su`: `sudo chown -R aionis:aionis ~/MikroGit` (см. `tg/mkgit_doctor.sh`) |
 | `Unit mkgit-bot.service not found` | Юнит не установлен: `sudo cp tg/mkgit-bot.service.example /etc/systemd/system/mkgit-bot.service && sudo systemctl daemon-reload` |
 | Бот стартует, но бэкапы падают с «Cannot connect» | Бот запущен от root → ключ ищется в `/root/.ssh`. Запускайте от `aionis` (см. «Не запускайте от root») |
 | Бэкапы «перед обновлением» пропали | Проверьте `MAX_PRE_UPDATE_BACKUPS`: они ротируются отдельно от плановых |
