@@ -37,6 +37,15 @@ sec()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
 DK_OWNER="$(stat -c %U "$DK_REPO_DIR" 2>/dev/null || echo "?")"
 DK_RUN_USER="$(id -un)"
 
+# Домашний каталог для проверок: если запущено через sudo (root), смотрим
+# домашний каталог ВЛАДЕЛЬЦА репозитория, а не /root — иначе доктор «не видит»
+# ключ и ругается на /root/.ssh (это сбивало с толку).
+DK_HOME="$HOME"
+if [ "$DK_RUN_USER" = "root" ] && [ "$DK_OWNER" != "root" ]; then
+    DK_HOME="$(getent passwd "$DK_OWNER" 2>/dev/null | cut -d: -f6)"
+    DK_HOME="${DK_HOME:-/home/$DK_OWNER}"
+fi
+
 printf 'MikroGit doctor\n'
 printf 'Репозиторий : %s\n' "$DK_REPO_DIR"
 printf 'Владелец    : %s\n' "$DK_OWNER"
@@ -109,7 +118,7 @@ fi
 
 # --- 4. SSH-ключ --------------------------------------------------------------
 sec "4. SSH-ключ для роутеров"
-DK_KEY="${SSH_KEY:-$HOME/.ssh/mk_key}"
+DK_KEY="${SSH_KEY:-$DK_HOME/.ssh/mk_key}"
 if [ -n "${SSH_KEY:-}" ]; then
     ok "SSH_KEY из конфига: $SSH_KEY"
 fi
@@ -123,26 +132,65 @@ if [ -f "$DK_KEY" ]; then
     PERM=$(stat -c %a "$DK_KEY" 2>/dev/null)
     [ "$PERM" = "600" ] && ok "права 600" || warn "права $PERM — рекомендуется 600 (chmod 600 $DK_KEY)"
     # есть ли ключи вообще
-    OTHER_KEYS=$(ls -1 "$HOME"/.ssh/*.pub 2>/dev/null | head -5)
+    OTHER_KEYS=$(ls -1 "$DK_HOME"/.ssh/*.pub 2>/dev/null | head -5)
     [ -n "$OTHER_KEYS" ] && echo "     Другие ключи в ~/.ssh: $(printf '%s ' $OTHER_KEYS)"
 else
     warn "ключ $DK_KEY не найден"
-    echo "     Варианты: создать новый  ssh-keygen -t rsa -b 4096 -f ~/.ssh/mk_key -N ''"
+    echo "     Варианты: создать новый  ssh-keygen -t rsa -b 4096 -f $DK_HOME/.ssh/mk_key -N ''"
     echo "               или задать существующий в tg/tg_bot_config.sh: export SSH_KEY=~/.ssh/ключ"
     ls -1 "$HOME"/.ssh/id_* 2>/dev/null | sed 's/^/       есть: /'
 fi
 if [ "$DK_RUN_USER" = "root" ]; then
-    bad "запуск от root: HOME=/root, ключ будет искаться в /root/.ssh — работайте от $DK_OWNER"
+    if [ "$FIX" = "1" ] && [ "$DK_OWNER" != "root" ]; then
+        ok "запуск через sudo для --fix — так и нужно (проверки ключа идут по $DK_HOME)"
+    else
+        bad "запуск от root: HOME=/root, ключ будет искаться в /root/.ssh — работайте от $DK_OWNER"
+        echo "     Запускайте диагностику без sudo:  bash tg/mkgit_doctor.sh"
+    fi
 fi
 
 # --- 5. Процессы и локи -------------------------------------------------------
 sec "5. Процессы бота и блокировки"
-BOT_PIDS=$(pgrep -f 'mk_tg_bot\.sh' 2>/dev/null || true)
+# pid самого доктора и всех его родителей — их нельзя считать «копиями бота»
+# (в командной строке оболочки может быть текст mk_tg_bot.sh из наших же команд)
+dk_ancestors() {
+    local p=$$ out="" i=0
+    while [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ] && [ "$i" -lt 20 ]; do
+        out="$out $p"
+        p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
+        i=$((i + 1))
+    done
+    echo "$out"
+}
+DK_ANC=" $(dk_ancestors) "
+
+BOT_PIDS=""
+for p in $(pgrep -f "mk_tg_bot\.sh" 2>/dev/null || true); do
+    case "$DK_ANC" in *" $p "*) continue ;; esac
+    # отсекаем сам доктор и оболочки, в командной строке которых он упомянут
+    _cmd=$(tr "\0" " " < "/proc/$p/cmdline" 2>/dev/null)
+    case "$_cmd" in
+        *mkgit_doctor.sh*|*pgrep*) continue ;;
+    esac
+    BOT_PIDS="$BOT_PIDS $p"
+done
+BOT_PIDS=$(echo $BOT_PIDS)
+BOT_N=0
 if [ -n "$BOT_PIDS" ]; then
     for p in $BOT_PIDS; do
-        printf '  • бот pid=%s: %s\n' "$p" "$(ps -o user=,etime=,args= -p "$p" 2>/dev/null | sed 's/^ *//' | cut -c1-90)"
+        [ -d "/proc/$p" ] || continue
+        BOT_N=$((BOT_N + 1))
+        ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+        pcmd=$(ps -o args= -p "$ppid" 2>/dev/null | cut -c1-60)
+        printf '  • бот pid=%s: %s\n' "$p" "$(ps -o user=,etime=,args= -p "$p" 2>/dev/null | sed 's/^ *//' | cut -c1-70)"
+        printf '      родитель pid=%s: %s\n' "${ppid:-?}" "${pcmd:-?}"
     done
-    [ "$(printf '%s\n' "$BOT_PIDS" | grep -c .)" -gt 1 ] && bad "запущено несколько копий бота — оставьте одну"
+    if [ "$BOT_N" -gt 1 ]; then
+        bad "запущено несколько копий бота ($BOT_N) — оставьте одну"
+        echo "     Остановить все:  pkill -f mk_tg_bot.sh"
+        echo "     Если копии появляются снова — их кто-то перезапускает: смотрите"
+        echo "     строку «родитель» выше (tmux/screen-сессия, systemd, cron, while-loop)."
+    fi
 else
     warn "бот не запущен"
 fi
@@ -150,8 +198,19 @@ SCH_PIDS=$(pgrep -f 'mk_schedule\.sh (daemon|start)' 2>/dev/null || true)
 [ -n "$SCH_PIDS" ] && ok "планировщик работает (pid=$(echo $SCH_PIDS | tr ' ' ','))" || warn "планировщик не запущен"
 
 DK_LOCK="$(dirname "${DK_LOG_FILE:-$DK_REPO_DIR/logs/mk_backup.log}")/mk_tg_bot.lock"
-[ -f "$DK_LOCK" ] && warn "файл лока существует: ${DK_LOCK/#$HOME/~} (владелец: $(stat -c %U "$DK_LOCK"))" \
-                   || ok "lock-файла бота нет"
+if [ -f "$DK_LOCK" ]; then
+    warn "файл лока существует: ${DK_LOCK/#$DK_HOME/~} (владелец: $(stat -c %U "$DK_LOCK" 2>/dev/null))"
+    if command -v fuser > /dev/null 2>&1; then
+        LOCK_PIDS=$(fuser "$DK_LOCK" 2>/dev/null | tr -s ' ' | sed 's/^ //')
+        if [ -n "$LOCK_PIDS" ]; then
+            echo "     лок РЕАЛЬНО держат pid: $LOCK_PIDS"
+        else
+            echo "     лок никем не удерживается — файл остался от прошлого запуска (не мешает)"
+        fi
+    fi
+else
+    ok "lock-файла бота нет"
+fi
 
 for d in update_state deploy_state harden_state schedule; do
     st="$(dirname "${DK_LOG_FILE:-$DK_REPO_DIR/logs/mk_backup.log}")/$d"

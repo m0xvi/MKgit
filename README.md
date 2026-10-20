@@ -93,16 +93,18 @@ bash tg/mk_schedule.sh run updates   # проверка/обновление н�
 
 ### systemd (бот + расписание после перезагрузки)
 
-В репозитории есть готовые юниты:
+Устанавливается одной командой (из **любого** каталога, через `sudo`):
 
 ```bash
-sudo cp tg/mkgit-bot.service.example      /etc/systemd/system/mkgit-bot.service
-sudo cp tg/mkgit-schedule.service.example /etc/systemd/system/mkgit-schedule.service
-# поправьте в них User=/пути, если у вас другой пользователь/каталог
-sudo systemctl daemon-reload
-sudo systemctl enable --now mkgit-bot mkgit-schedule
-sudo systemctl status mkgit-bot mkgit-schedule
+sudo bash ~/MikroGit/tg/install_systemd.sh --dry-run   # посмотреть план
+sudo bash ~/MikroGit/tg/install_systemd.sh             # установить и запустить
 ```
+
+Скрипт сам подставит реальный путь к репозиторию и пользователя-владельца,
+остановит ручные копии бота (иначе конфликт по lock), поставит юниты,
+сделает `daemon-reload` и `enable --now`.
+
+Удалить юниты: `sudo bash ~/MikroGit/tg/install_systemd.sh --uninstall`.
 
 - `mkgit-bot` — Telegram-бот;
 - `mkgit-schedule` — планировщик (ежедневный бэкап + недельные обновления).
@@ -124,6 +126,20 @@ sudo systemctl status mkgit-bot mkgit-schedule
 
 ```bash
 sudo chown -R aionis:aionis /home/aionis/MikroGit
+```
+
+### Про пути в командах
+
+Команды из README выполняются **из корня репозитория** (`~/MikroGit`).
+Если вы уже внутри `tg/`, путь `tg/...` станет `tg/tg/...` и вы получите
+`No such file or directory` — поднимайтесь на уровень выше (`cd ..`) или
+используйте полные пути:
+
+```bash
+cd ~/MikroGit                       # корень проекта
+bash tg/mk_schedule.sh status
+bash tg/mkgit_doctor.sh
+sudo bash tg/install_systemd.sh
 ```
 
 ### Диагностика одной командой
@@ -309,7 +325,9 @@ bash tg/mk_updates.sh status
 | Расписание не срабатывает | `bash tg/mk_schedule.sh status` — демон запущен? Проверьте время сервера/часовой пояс |
 | `No such file or directory` при `bash tg/mk_schedule.sh` | Команда запускается из каталога `tg/` — используйте `bash mk_schedule.sh status` или `bash tg/mk_schedule.sh status` из корня проекта |
 | git: `dubious ownership` / `cannot open .git/FETCH_HEAD: Permission denied` | Репозиторием владеет root после `sudo su`: `sudo chown -R aionis:aionis ~/MikroGit` (см. `tg/mkgit_doctor.sh`) |
-| `Unit mkgit-bot.service not found` | Юнит не установлен: `sudo cp tg/mkgit-bot.service.example /etc/systemd/system/mkgit-bot.service && sudo systemctl daemon-reload` |
+| `Unit mkgit-bot.service not found` | Юнит не установлен: `sudo bash ~/MikroGit/tg/install_systemd.sh` |
+| `cp: cannot stat 'tg/mkgit-bot.service.example'` | Команда запущена из `tg/` — вернитесь в корень репозитория (`cd ~/MikroGit`) |
+| Копии бота появляются снова после `pkill` | Их перезапускает tmux/screen-сессия или цикл: смотрите `tg/mkgit_doctor.sh` (строка «родитель») и `tmux ls` |
 | Бот стартует, но бэкапы падают с «Cannot connect» | Бот запущен от root → ключ ищется в `/root/.ssh`. Запускайте от `aionis` (см. «Не запускайте от root») |
 | Бэкапы «перед обновлением» пропали | Проверьте `MAX_PRE_UPDATE_BACKUPS`: они ротируются отдельно от плановых |
 
