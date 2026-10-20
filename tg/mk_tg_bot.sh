@@ -212,7 +212,13 @@ perform_backup() {
         if bash "$BACKUP_SCRIPT" --telegram "manual" >> "$LOG_FILE" 2>&1; then
             log "Backup all completed successfully"
         else
-            tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Backup failed!</b> Check logs."
+            local why
+            why=$(bkl_failed_block 5)
+            if [ -n "$why" ]; then
+                tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Backup failed!</b>\n\n<b>Почему не вышло:</b>\n$why\nЛог: <code>$LOG_FILE</code>"
+            else
+                tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Backup failed!</b>\nПричина не определилась — лог: <code>$LOG_FILE</code>"
+            fi
             error "Backup failed for all devices"
         fi
     else
@@ -220,7 +226,16 @@ perform_backup() {
             tg_send_message "$TELEGRAM_CHAT_ID" "✅ <b>Backup OK!</b>\nDevice: $device_name"
             log "Backup OK: $device_name"
         else
-            tg_send_message "$TELEGRAM_CHAT_ID" "❌ <b>Backup failed!</b>\nDevice: $device_name\nCheck logs."
+            local why hint msg
+            why=$(bkl_last_error "$device_name")
+            [ -n "$why" ] || why=$(bkl_last_error "сервер")
+            [ -n "$why" ] || why="нет подробностей — смотрите лог"
+            why=$(printf '%s' "$why" | cut -c1-300 | bkl_html_escape)
+            hint=$(bkl_reason_hint "$(bkl_last_error "$device_name")")
+            msg="❌ <b>Backup failed!</b>\nDevice: <b>$device_name</b>\n\n<b>Причина:</b> $why"
+            [ -n "$hint" ] && msg+="\n💡 $(printf '%s' "$hint" | bkl_html_escape)"
+            msg+="\n\nЛог: <code>$LOG_FILE</code>"
+            tg_send_message "$TELEGRAM_CHAT_ID" "$msg"
             error "Backup failed: $device_name"
         fi
     fi

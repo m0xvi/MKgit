@@ -50,6 +50,8 @@ LOG_DIR="${LOG_DIR:-$REPO_DIR/logs}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/mk_backup.log}"
 REPORTS_DIR="${REPORTS_DIR:-$LOG_DIR/reports}"
 MAX_REPORTS="${MAX_REPORTS:-5}"
+# Итоги последнего запуска — их читает бот, чтобы показать причину сбоя
+BACKUP_STATUS_FILE="${BACKUP_STATUS_FILE:-$LOG_DIR/last_backup_status.tsv}"
 
 # Минимальный «правдоподобный» размер .backup (меньше — считаем битым файлом)
 MIN_BACKUP_BYTES="${MIN_BACKUP_BYTES:-512}"
@@ -167,9 +169,11 @@ info()    { emit_log "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')] INFO:${NC} $1"; }
 
 # --- Telegram notification ---------------------------------------------------
 send_telegram_notification() {
-    local message="$1"
+    local message="$1" keyboard="${2:-}"
     [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] || return 0
-    if declare -f tg_send_message > /dev/null 2>&1; then
+    if [ -n "$keyboard" ] && declare -f tg_send_keyboard > /dev/null 2>&1; then
+        tg_send_keyboard "$TELEGRAM_CHAT_ID" "$message" "$keyboard"
+    elif declare -f tg_send_message > /dev/null 2>&1; then
         tg_send_message "$TELEGRAM_CHAT_ID" "$message"
     else
         local proxy_arg=()
@@ -191,6 +195,7 @@ acquire_lock() {
     exec 7> "$BACKUP_LOCK_FILE"
     if ! flock -w "$BACKUP_LOCK_WAIT" 7; then
         error "Другой бэкап не завершился за ${BACKUP_LOCK_WAIT}с (lock: $BACKUP_LOCK_FILE). Выход."
+        bkl_status_record fail "сервер" "предыдущий бэкап не завершился за ${BACKUP_LOCK_WAIT}с — запуск пропущен"
         exit 75
     fi
     echo "$$" >&7
@@ -812,6 +817,7 @@ main() {
     fi
 
     ensure_dirs
+    bkl_status_reset
     log "===== MikroTik Backup ($([ "$PRE_UPDATE" = 1 ] && echo 'перед обновлением' || echo 'плановый')) ====="
     log "Configuration file: $CONFIG_FILE"
     log "Backup directory:   $BACKUP_DIR"
@@ -825,11 +831,13 @@ main() {
 
     if [ ! -f "$CONFIG_FILE" ]; then
         error "Configuration file $CONFIG_FILE not found!"
+        bkl_status_record fail "сервер" "не найден $CONFIG_FILE"
         send_telegram_notification "❌ <b>Backup failed!</b>\nConfig file not found: $CONFIG_FILE"
         exit 1
     fi
     if [ ! -f "$SSH_KEY" ]; then
         error "SSH key $SSH_KEY not found!"
+        bkl_status_record fail "сервер" "не найден SSH-ключ $SSH_KEY (ssh-keygen -t rsa -f $SSH_KEY)"
         exit 1
     fi
     chmod 600 "$SSH_KEY" 2>/dev/null || true
@@ -837,6 +845,7 @@ main() {
     mapfile -t DEVICES_ARRAY < <(read_devices)
     if [ ${#DEVICES_ARRAY[@]} -eq 0 ]; then
         error "No devices found in config"
+        bkl_status_record fail "сервер" "в $CONFIG_FILE нет устройств"
         send_telegram_notification "❌ <b>Backup failed!</b>\nNo devices configured."
         exit 1
     fi
@@ -849,6 +858,7 @@ main() {
         done
         if [ ${#filtered[@]} -eq 0 ]; then
             error "Device $DEVICE_NAME not found"
+            bkl_status_record fail "$DEVICE_NAME" "устройства нет в $CONFIG_FILE"
             send_telegram_notification "❌ <b>Backup failed!</b>\nDevice not found: $DEVICE_NAME"
             exit 1
         fi
@@ -883,6 +893,7 @@ main() {
             ((success_count++))
             RUN_RESULT[$name]="ok"
             RUN_FILE[$name]="$LAST_BACKUP_FILE"
+            bkl_status_record ok "$name" ""
             if [ -n "$TELEGRAM_NOTIFICATION" ]; then
                 send_telegram_notification "✅ <b>Backup OK!</b>\nDevice: <b>$name</b>\nFile: <code>$(basename "${LAST_BACKUP_FILE:-?}")</code>\nWhere: <code>$BACKUP_DIR/$name/</code>"
             fi
@@ -890,12 +901,15 @@ main() {
             ((fail_count++))
             RUN_RESULT[$name]="fail"
             RUN_ERROR[$name]="${BACKUP_ERROR:-(см. лог)}"
+            bkl_status_record fail "$name" "${RUN_ERROR[$name]}"
             if [ -n "$TELEGRAM_NOTIFICATION" ]; then
-                if [ -n "${BACKUP_ERROR:-}" ]; then
-                    send_telegram_notification "❌ <b>Backup failed!</b>\nDevice: <b>$name</b>\nПричина: $BACKUP_ERROR\nЛог: <code>$LOG_FILE</code>"
-                else
-                    send_telegram_notification "❌ <b>Backup failed!</b>\nDevice: $name\nCheck logs: <code>$LOG_FILE</code>"
-                fi
+                local why hint
+                why=$(printf '%s' "${BACKUP_ERROR:-нет подробностей (см. лог)}" | cut -c1-300 | bkl_html_escape)
+                hint=$(bkl_reason_hint "${BACKUP_ERROR:-}")
+                local hint_line=""
+                [ -n "$hint" ] && hint_line="\n💡 $(printf '%s' "$hint" | bkl_html_escape)"
+                send_telegram_notification "❌ <b>Backup failed!</b>\nDevice: <b>$name</b>\n\n<b>Причина:</b> $why${hint_line}\n\nЛог: <code>$LOG_FILE</code>" \
+                    '[[{"text":"📜 Логи","callback_data":"logs_menu"}]]'
             fi
         fi
         echo "----------------------------------------"
@@ -919,7 +933,10 @@ main() {
         if [ "$fail_count" -eq 0 ]; then
             send_telegram_notification "✅ <b>All backups OK!</b>\nDevices: $success_count/$total_devices\nFormat: .backup\nTime: $(date)"
         else
-            send_telegram_notification "⚠️ <b>Backup completed with errors</b>\nOK: $success_count/$total_devices\nFailed: $fail_count\nTime: $(date)"
+            local fail_block
+            fail_block=$(bkl_failed_block 5)
+            send_telegram_notification "⚠️ <b>Backup completed with errors</b>\nOK: $success_count/$total_devices • Failed: $fail_count\nTime: $(date)${fail_block:+\n\n<b>Почему не вышло:</b>\n$fail_block}" \
+                '[[{"text":"📜 Логи","callback_data":"logs_menu"}]]'
         fi
     fi
 

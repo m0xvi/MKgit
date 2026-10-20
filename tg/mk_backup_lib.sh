@@ -103,3 +103,96 @@ bkl_label() {
 bkl_device_of() {
     basename "$(dirname "${1:-}")"
 }
+
+# =============================================================================
+# Причины сбоев: подсказки + итоги последнего запуска (для Telegram-бота)
+# =============================================================================
+
+# Экранирование для parse_mode=HTML
+bkl_html_escape() {
+    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# Убрать HTML-теги (для однострочных выжимок)
+bkl_strip_tags() {
+    sed -e 's/<[^>]*>//g'
+}
+
+# Короткая подсказка «что делать» по тексту причины
+bkl_reason_hint() {
+    local r="${1:-}"
+    [ -n "$r" ] || return 0
+    case "$r" in
+        *"политика ftp"*|*"scp/sftp"*|*"Not a directory"*|*"scp:"*)
+            echo "у пользователя нет политики ftp — без неё scp/sftp не читают файлы: /user group set <группа> policy=...,ftp" ;;
+        *"нет SSH-доступа"*|*"Cannot connect"*|*"Connection refused"*|*"Connection timed out"*|*"No route to host"*|*"Permission denied (publickey"*|*"Host key verification failed"*)
+            echo "проверьте сеть/порт и ключ: на роутере /user ssh-keys print, у пользователя политики ssh (и read/write)" ;;
+        *"не создаётся"*|*"мало места"*|*"no space"*|*"not enough free"*|*"disk full"*|*"не появился"*)
+            echo "мало места на flash: /system resource print → free-hdd-space, /file print; лишние файлы удаляются вручную" ;;
+        *"login failed"*|*"invalid user"*|*"Authentication failed"*)
+            echo "проверьте пользователя/ключ в devices.conf" ;;
+    esac
+}
+
+# Файл итогов последнего запуска: ok|fail <TAB> устройство <TAB> время <TAB> причина
+bkl_status_file() {
+    if [ -n "${BACKUP_STATUS_FILE:-}" ]; then
+        echo "$BACKUP_STATUS_FILE"
+    elif [ -n "${LOG_DIR:-}" ]; then
+        echo "$LOG_DIR/last_backup_status.tsv"
+    else
+        # в боте задан только LOG_FILE (= .../logs/mk_backup.log)
+        echo "$(dirname "${LOG_FILE:-/tmp/mk_backup.log}")/last_backup_status.tsv"
+    fi
+}
+
+bkl_status_reset() {
+    : > "$(bkl_status_file)" 2>/dev/null || true
+}
+
+bkl_status_record() {
+    local st="${1:-}" dev="${2:-}" reason="${3:-}"
+    [ -n "$st" ] && [ -n "$dev" ] || return 0
+    reason=$(printf '%s' "$reason" | tr '\t\n\r' '   ' | cut -c1-300)
+    printf '%s\t%s\t%s\t%s\n' "$st" "$dev" "$(date '+%Y-%m-%d %H:%M:%S')" "$reason" \
+        >> "$(bkl_status_file)" 2>/dev/null || true
+}
+
+# Неудачи последнего запуска, по одной строке "устройство<TAB>причина" (не более $1)
+bkl_failed_list() {
+    local max="${1:-5}" f
+    f=$(bkl_status_file)
+    [ -s "$f" ] || return 0
+    awk -F'\t' -v max="$max" '
+        $1 == "fail" { n++; dev[n]=$2; why[n]=$4 }
+        END {
+            start = (n > max) ? n - max + 1 : 1
+            if (n > max) printf "…и ещё %d\n", n - max
+            for (i = start; i <= n; i++) printf "%s\t%s\n", dev[i], (why[i] == "" ? "см. лог" : why[i])
+        }' "$f"
+}
+
+# Готовый HTML-блок «Почему не вышло» для сообщения бота (пусто, если неудач нет)
+bkl_failed_block() {
+    local max="${1:-5}" dev why hint out=""
+    while IFS=$'\t' read -r dev why; do
+        [ -n "$dev" ] || continue
+        if [ "$dev" = "…и ещё" ] || [ "${dev#…и ещё}" != "$dev" ]; then
+            out+="<i>$dev ${why}</i>"$'\n'
+            continue
+        fi
+        why=$(printf '%s' "$why" | cut -c1-200)
+        hint=$(bkl_reason_hint "$why")
+        out+="• <b>$(printf '%s' "$dev" | bkl_html_escape)</b>: $(printf '%s' "$why" | bkl_html_escape)"$'\n'
+        [ -n "$hint" ] && out+="  💡 $(printf '%s' "$hint" | bkl_html_escape)"$'\n'
+    done < <(bkl_failed_list "$max")
+    [ -n "$out" ] && printf '%s' "$out"
+}
+
+# Причина последнего сбоя по устройству ("" — не было)
+bkl_last_error() {
+    local dev="${1:-}" f
+    f=$(bkl_status_file)
+    [ -s "$f" ] || return 0
+    awk -F'\t' -v d="$dev" '$1 == "fail" && $2 == d { why=$4 } END { print why }' "$f"
+}

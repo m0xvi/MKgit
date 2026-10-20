@@ -105,13 +105,58 @@ fi
 rup_log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE: $*" | tee -a "${LOG_FILE:-/tmp/mk_updates.log}"; }
 rup_err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE ERROR: $*" | tee -a "${LOG_FILE:-/tmp/mk_updates.log}" >&2; }
 
+# Последние ошибки по устройствам: устройство<TAB>сообщение
+# (чтобы итоговая сводка «обновление всех» объясняла причины, а не только считала)
+rup_err_file() { echo "$(rup_state_dir)/last_errors.tsv"; }
+rup_errors_reset() {
+    mkdir -p "$(rup_state_dir)" 2>/dev/null || true
+    : > "$(rup_err_file)" 2>/dev/null || true
+}
+rup_note_error() {
+    local dev="${1:-}" msg="${2:-}"
+    [ -n "$dev" ] && [ -n "$msg" ] || return 0
+    mkdir -p "$(rup_state_dir)" 2>/dev/null || true
+    printf '%s\t%s\n' "$dev" "$(printf '%s' "$msg" | tr '\t\n\r' '   ')" >> "$(rup_err_file)" 2>/dev/null || true
+}
+# Устройство, к которому относится текущее сообщение (заполняют воркеры)
+RUP_CUR_DEV=""
+
 rup_send() {
     # Отправка сообщения в чат (TG-хелперы должны быть загружены; иначе no-op)
+    case "${1:-}" in
+        ❌*|⚠️*|🛑*) [ -n "${RUP_CUR_DEV:-}" ] && rup_note_error "$RUP_CUR_DEV" "$1" ;;
+    esac
     if declare -f tg_send_message > /dev/null 2>&1; then
         tg_send_message "${TELEGRAM_CHAT_ID:-}" "$1"
     else
         rup_log "(tg_send_message недоступен) $1"
     fi
+}
+
+# HTML-блок «Почему не вышло» для итоговой сводки (пусто, если ошибок нет)
+rup_errors_block() {
+    local max="${1:-6}" out="" dev msg hint n=0
+    local f; f=$(rup_err_file)
+    [ -s "$f" ] || return 0
+    while IFS=$'\t' read -r dev msg; do
+        [ -n "$dev" ] || continue
+        n=$((n+1))
+        [ "$n" -gt "$max" ] && { out+="<i>…и ещё</i>"$'\n'; break; }
+        hint=""
+        if declare -f bkl_reason_hint > /dev/null 2>&1; then
+            hint=$(bkl_reason_hint "$msg")
+        fi
+        # убираем эмодзи-статус и повтор «устройство:» — имя уже выводим сами
+        msg="${msg#❌ }"; msg="${msg#⚠️ }"; msg="${msg#🛑 }"; msg="${msg#⏳ }"; msg="${msg#🚫 }"
+        msg=$(printf '%s' "$msg" | sed -E 's/^\[[0-9]+\/[0-9]+\] //')
+        msg="${msg#<b>$dev</b>: }"
+        msg=$(printf '%s' "$msg" | sed -e 's/<[^>]*>//g' | cut -c1-200 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+        out+="• <b>$dev</b>: $msg"$'\n'
+        [ -n "$hint" ] && out+="  💡 $hint"$'\n'
+    done < <(awk -F'\t' '
+        { if (!($1 in seen)) { n++; order[n]=$1 } seen[$1]=1; msg[$1]=$2 }
+        END { for (i = 1; i <= n; i++) print order[i] "\t" msg[order[i]] }' "$f")
+    [ -n "$out" ] && printf '%s' "$out"
 }
 
 rup_send_keyboard() {
@@ -645,6 +690,7 @@ rup_backup_before_update() {
 rup_worker_apply() {
     local name="$1"
     rup_ensure_dirs
+    RUP_CUR_DEV="$name"
 
     if ! rup_lock_acquire "apply_$name" 3; then
         rup_busy_message "$name"
@@ -860,6 +906,7 @@ rup_rb_after_apply() {
 # ВОРКЕР: отдельное обновление RouterBOOT firmware на устройстве
 # (когда RouterOS уже актуален, а загрузчик — нет)
 rup_worker_rb() {
+    RUP_CUR_DEV="${1:-}"
     local name="$1"
     rup_ensure_dirs
 
@@ -959,6 +1006,7 @@ rup_worker_update_all() {
         return 1
     fi
     rup_stop_clear
+    rup_errors_reset
     local -a names=()
     local name
     while IFS= read -r name; do
@@ -966,6 +1014,7 @@ rup_worker_update_all() {
     done < <(rup_ordered_names)
     local total=${#names[@]}
     if [ "$total" = 0 ]; then
+        RUP_CUR_DEV=""
         rup_send "❌ Нет устройств в devices.conf."
         rup_lock_release "update_all"
         return 1
@@ -979,6 +1028,7 @@ rup_worker_update_all() {
             break
         fi
         n=$((n+1))
+        RUP_CUR_DEV="$name"
         rup_send_stop "▶️ [$n/$total] <b>$name</b>: начинаю (проверка состояния)…"
         tsv=$(rup_check_device "$name")
         IFS=$'\t' read -r _ status _ _ _ _ det <<< "$tsv"
@@ -997,10 +1047,13 @@ rup_worker_update_all() {
         esac
         rup_send "✅ [$n/$total] <b>$name</b>: обработан. Перехожу к следующему…"
     done
+    local why
+    why=$(rup_errors_block 6)
+    RUP_CUR_DEV=""
     if [ "$stopped" = "1" ]; then
-        rup_send "🛑 <b>Обновление всех остановлено пользователем</b> (после $n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err"
+        rup_send "🛑 <b>Обновление всех остановлено пользователем</b> (после $n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err${why:+\n\n<b>Почему не вышло:</b>\n$why}"
     else
-        rup_send "📊 <b>Обновление всех завершено</b> ($n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err"
+        rup_send "📊 <b>Обновление всех завершено</b> ($n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err${why:+\n\n<b>Почему не вышло:</b>\n$why}"
     fi
     rup_stop_clear
     rup_lock_release "update_all"
@@ -1012,9 +1065,11 @@ rup_worker_apply_list() {
     rup_ensure_dirs
     local listf="$(rup_state_dir)/apply_list.txt"
     if [ ! -s "$listf" ]; then
+        RUP_CUR_DEV=""
         rup_send "❌ Список устройств для обновления пуст."
         return 1
     fi
+    rup_errors_reset
     if ! rup_lock_acquire update_all 5; then
         rup_busy_message "обновление выбранных устройств"
         return 1
@@ -1032,6 +1087,7 @@ rup_worker_apply_list() {
     for name in "${names[@]}"; do
         if rup_stop_requested; then rup_stop_clear; stopped=1; break; fi
         n=$((n+1))
+        RUP_CUR_DEV="$name"
         rup_send_stop "▶️ [$n/$total] <b>$name</b>…"
         tsv=$(rup_check_device "$name")
         IFS=$'\t' read -r _ status _ _ _ _ det <<< "$tsv"
@@ -1046,10 +1102,13 @@ rup_worker_apply_list() {
                 err=$((err+1)); rup_send "⚠️ [$n/$total] <b>$name</b>: ${det:-ошибка} — пропущен." ;;
         esac
     done
+    local why2
+    why2=$(rup_errors_block 6)
+    RUP_CUR_DEV=""
     if [ "$stopped" = "1" ]; then
-        rup_send "🛑 Выборочное обновление остановлено ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err"
+        rup_send "🛑 Выборочное обновление остановлено ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err${why2:+\n\n<b>Почему не вышло:</b>\n$why2}"
     else
-        rup_send "📊 <b>Выборочное обновление завершено</b> ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err"
+        rup_send "📊 <b>Выборочное обновление завершено</b> ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err${why2:+\n\n<b>Почему не вышло:</b>\n$why2}"
     fi
     rup_stop_clear
     rup_lock_release "update_all"
