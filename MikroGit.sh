@@ -606,7 +606,7 @@ backup_device() {
             ros_cleanup_old_backups 0 "$need_bytes" 0 || true
         fi
         after=$(ros_free_bytes); after="${after:-0}"
-        if [ "$after" -le "$before" ]; then
+        if [ "$after" -le "$before" ] && [ "${ROS_CLEANED_BYTES:-0}" -eq 0 ]; then
             # чистить нечего: flash занят чем-то посторонним
             warning "$DEV_NAME: на роутере нечего удалять — старых файлов наших бэкапов нет."
             local tops
