@@ -38,7 +38,7 @@ TARGET_GROUP="mikrogit"
 # установка обновлений RouterOS из самого роутера (/system package update...,
 # RouterBOOT). Политика policy нужна для операций с пакетами; если планируется
 # только резервное копирование — можно сократить (например ssh,read,write).
-TARGET_POLICY="ssh,read,write,test,reboot,policy"
+TARGET_POLICY="ssh,read,write,test,reboot,policy,ftp"
 
 # Транспорт входа АДМИНИСТРАТОРА (TL_USER) на роутер:
 #   auto   — telnet, если порт открыт, иначе ssh (по умолчанию; для роутеров,

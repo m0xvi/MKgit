@@ -80,6 +80,13 @@ rup_state_dir() {
 UPDATE_AUTO_CHECK="${UPDATE_AUTO_CHECK:-0}"
 UPDATE_AUTO_INTERVAL_HOURS="${UPDATE_AUTO_INTERVAL_HOURS:-24}"
 
+# Каталог бэкапов (тот же, что у MikroGit.sh): нужен, чтобы показать в
+# Telegram точное место, куда сохранён бэкап перед обновлением, и найти его.
+BACKUP_DIR="${BACKUP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bckp}"
+
+# Делать бэкап перед обновлением RouterBOOT firmware (1 = да)
+UPDATE_BACKUP_BEFORE_RB="${UPDATE_BACKUP_BEFORE_RB:-1}"
+
 # SSH опции (по образцу остальных скриптов репозитория)
 RUP_SSH_OPTS="${RUP_SSH_OPTS:--o PubkeyAcceptedAlgorithms=+ssh-rsa -o ConnectTimeout=15 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=20 -o ServerAliveCountMax=20}"
 RUP_SSH_BIN="${RUP_SSH_BIN:-ssh}"
@@ -88,6 +95,12 @@ RUP_SSH_BIN="${RUP_SSH_BIN:-ssh}"
 # Служебное
 # -----------------------------------------------------------------------------
 RUP_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Общая библиотека работы с файлами бэкапов (список/пометки pre_update)
+if [ -f "$RUP_SCRIPT_DIR/mk_backup_lib.sh" ]; then
+    # shellcheck source=mk_backup_lib.sh
+    source "$RUP_SCRIPT_DIR/mk_backup_lib.sh"
+fi
 
 rup_log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE: $*" | tee -a "${LOG_FILE:-/tmp/mk_updates.log}"; }
 rup_err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE ERROR: $*" | tee -a "${LOG_FILE:-/tmp/mk_updates.log}" >&2; }
@@ -587,22 +600,43 @@ $(rup_report_summary "$all_tsv")"
 # ПРЕДВАРИТЕЛЬНОЕ РЕЗЕРВНОЕ КОПИРОВАНИЕ (MikroGit.sh)
 # -----------------------------------------------------------------------------
 rup_backup_before_update() {
-    # $1 - device_name
-    local name="$1"
-    [ "${UPDATE_BACKUP_BEFORE_APPLY:-1}" = "1" ] || return 0
+    # $1 - device_name, $2 - причина (RouterOS install / RouterBOOT), $3 - 1 = обязательно
+    local name="$1" reason="${2:-обновление}" required="${3:-1}"
+    [ "${UPDATE_BACKUP_BEFORE_APPLY:-1}" = "1" ] || {
+        rup_send "ℹ️ <b>$name</b>: бэкап перед обновлением отключён (<code>UPDATE_BACKUP_BEFORE_APPLY=0</code>)."
+        return 0
+    }
     local bs="${BACKUP_SCRIPT:-}"
     if [ -z "$bs" ] || [ ! -f "$bs" ]; then
         rup_log "BACKUP_SCRIPT не задан/не найден ($bs) — пропускаю предварительный бэкап"
+        if [ "$required" = "1" ]; then
+            rup_send "⚠️ <b>$name</b>: не задан <code>BACKUP_SCRIPT</code> — бэкап перед обновлением не сделан."
+            return 1
+        fi
         return 0
     fi
-    rup_send "🗄 Делаю резервную копию конфигурации <b>$name</b> перед обновлением…"
-    if bash "$bs" --device "$name" >> "${LOG_FILE:-/tmp/mk_updates.log}" 2>&1; then
-        rup_send "✅ Конфигурация <b>$name</b> сохранена (MikroGit)."
-        return 0
-    else
-        rup_send "⚠️ Не удалось создать резервную копию <b>$name</b>."
+    rup_send "🛡 <b>$name</b>: делаю резервную копию <b>.backup</b> перед $reason…\nФайл: <code>$(basename "${BACKUP_DIR:-bckp}")/$name/${name}_pre_update_&lt;дата&gt;.backup</code>"
+    local out rc
+    out=$(bash "$bs" --device "$name" --pre-update 2>&1)
+    rc=$?
+    rup_log "pre-update backup $name rc=$rc: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+    if [ "$rc" -ne 0 ]; then
+        rup_send "⚠️ Не удалось создать резервную копию <b>$name</b> перед $reason (rc=$rc).\nПоследние строки:\n<code>$(printf '%s' "$out" | tail -3 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')</code>"
         return 1
     fi
+    local latest="" dir
+    dir="${BACKUP_DIR:-}/$name"
+    if declare -f bkl_latest > /dev/null 2>&1; then
+        latest=$(bkl_latest "$dir" pre)
+    else
+        latest=$(ls -1t "$dir"/*pre_update*.backup 2>/dev/null | head -1)
+    fi
+    if [ -n "$latest" ] && [ -f "$latest" ]; then
+        rup_send "✅ Бэкап <b>$name</b> сохранён:\n<code>$latest</code>\n($(du -h "$latest" 2>/dev/null | cut -f1), 🛡 pre_update — доступен в боте: 📥 Download → 🛡 Перед обновлением)"
+        return 0
+    fi
+    rup_send "✅ Конфигурация <b>$name</b> сохранена (MikroGit): <code>$dir</code>"
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -653,7 +687,7 @@ rup_worker_apply() {
     fi
 
     # 2. Подтверждено пользователем — резервная копия
-    if ! rup_backup_before_update "$name"; then
+    if ! rup_backup_before_update "$name" "установкой RouterOS $latest" 1; then
         rup_send "🛑 <b>$name</b>: установка отменена (резервная копия не создана)."
         rup_lock_release "apply_$name"; trap - EXIT; return 1
     fi
@@ -854,6 +888,9 @@ rup_worker_rb() {
         return 0
     fi
     rup_send "🔩 <b>$name</b>: доступно обновление RouterBOOT firmware (<b>$cur → $upg</b>)."
+    if [ "${UPDATE_BACKUP_BEFORE_RB:-1}" = "1" ] && [ "${UPDATE_BACKUP_BEFORE_APPLY:-1}" = "1" ]; then
+        rup_backup_before_update "$name" "обновлением RouterBOOT firmware" 0 || true
+    fi
     rup_rb_exec_upgrade "$name" "$upg"
     local rc=$?
     rup_lock_release "apply_$name"; trap - EXIT

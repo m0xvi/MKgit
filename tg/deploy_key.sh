@@ -203,7 +203,11 @@ scrub_secrets() {
 }
 
 KEY_TEXT=$(tr -d '\r\n' < "$KEY_FILE")
-LOG="deploy_key_$(date +%Y%m%d_%H%M%S).log"
+# Лог — в logs/deploy/, а не в текущем каталоге запуска: раньше запуск из ~
+# оставлял там deploy_key_YYYYMMDD_*.log на каждый прогон (мусор в ~).
+DEPLOY_LOG_DIR="${DEPLOY_LOG_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)/logs/deploy}"
+mkdir -p "$DEPLOY_LOG_DIR" 2>/dev/null || DEPLOY_LOG_DIR="$SCRIPT_DIR"
+LOG="$DEPLOY_LOG_DIR/deploy_key_$(date +%Y%m%d_%H%M%S).log"
 
 echo "devices.conf : $DEVICES_CONF"
 echo "ключ         : $KEY_FILE"
