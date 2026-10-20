@@ -709,14 +709,17 @@ backup_device() {
     # недостающие политики (ftp, sensitive), не снимая остальные.
     if [ "$downloaded" != "1" ] && [ "${ROUTER_AUTO_FIX_POLICIES:-1}" = "1" ] && \
        [ -f "$SCRIPT_DIR/tg/deploy_key.sh" ] && ros_file_exists "${base}.backup"; then
-        local pflags pmissing=""
+        local pflags pmissing="" cur_group=""
         pflags=$(ros_user_policy_flags "$DEV_USER" 2>/dev/null)
         if [ -n "$pflags" ]; then
+            cur_group="${pflags%%|*}"        # текущая группа пользователя
             case "$pflags" in *"ftp=0"*)       pmissing="$pmissing ftp" ;; esac
             case "$pflags" in *"sensitive=0"*) pmissing="$pmissing sensitive" ;; esac
             case "$pflags" in *"read=0"*)      pmissing="$pmissing read" ;; esac
         fi
-        local fix_group="${DEPLOY_TARGET_GROUP-mikrogit}"
+        # правим ТУ группу, в которой пользователь уже состоит (чтобы деплой не
+        # переводил его в другую); mikrogit — только если группу прочитать не вышло
+        local fix_group="${cur_group:-${DEPLOY_TARGET_GROUP-mikrogit}}"
         local fix_policy="${DEPLOY_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}"
         # нам нужны именно sensitive и ftp — добавляем, даже если свой список короче
         case ",$fix_policy," in *,sensitive,*) ;; *) fix_policy="$fix_policy,sensitive" ;; esac
