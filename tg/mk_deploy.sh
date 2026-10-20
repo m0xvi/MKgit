@@ -5,8 +5,10 @@
 # Назначение:
 #   - запуск deploy_key.sh (SSH) по устройствам из devices.conf —
 #     установка SSH-ключа MikroGit целевому пользователю + проверка и доводка
-#     прав до МИНИМАЛЬНОЙ группы (DEPLOY_TARGET_GROUP, по умолчанию mikrogit,
-#     политики ssh,read,write,test,reboot,policy,ftp,sensitive) — прямо из бота
+#     прав: по умолчанию (@current) доводятся политики ТОЙ группы, в которой
+#     пользователь уже состоит, — его никуда не переводят; если пользователя
+#     ещё нет, создаётся группа mikrogit (политики
+#     ssh,read,write,test,reboot,policy,ftp,sensitive) — прямо из бота
 #     или консоли:
 #        bash tg/mk_deploy.sh all
 #        bash tg/mk_deploy.sh <device>
@@ -43,7 +45,9 @@ DEPLOY_TARGET_USER="${DEPLOY_TARGET_USER:-}"
 # Группа, в которую приводится целевой пользователь. Вместо встроенной full —
 # отдельная группа с МИНИМАЛЬНЫМ набором политик (DEPLOY_TARGET_POLICY);
 # на роутере группа создаётся автоматически, если её нет. Пусто = права не менять.
-DEPLOY_TARGET_GROUP="${DEPLOY_TARGET_GROUP:-mikrogit}"
+# "@current" = доводить политики ТОЙ группы, в которой пользователь уже
+# состоит (не переводить его); если пользователя нет — mikrogit.
+DEPLOY_TARGET_GROUP="${DEPLOY_TARGET_GROUP:-@current}"
 # Политики группы (применяются при СОЗДАНИИ группы; у существующей группы
 # недостающие политики ДОБАВЛЯЮТСЯ). Минимум для задач бота (бэкап + скачивание
 # .backup + проверка/установка обновлений RouterOS через роутер):
@@ -245,6 +249,20 @@ dep_result_message() {
     detail=$(dep_grep_good < "$log" | tail -n 14 | dep_html)
     if [ -n "$detail" ]; then
         body+="<code>$detail</code>"
+    fi
+    # Подсказка по конкретной причине (чтобы не гадать по логу).
+    if [ "$rc" -ne 0 ]; then
+        if grep -qa "не задан пароль администратора" "$log"; then
+            body+="\n\n💡 Причина: не задан пароль администратора. Укажите <code>DEPLOY_TL_USER=admin</code> и <code>DEPLOY_TL_PASS</code> в <code>tg_bot_config.sh</code> (или <code>TL_USER</code>/<code>TL_PASS</code> в <code>tg/deploy.conf</code>)."
+        elif grep -qa "неверный пароль" "$log"; then
+            body+="\n\n💡 Причина: роутер отклонил пароль администратора. Проверьте <code>DEPLOY_TL_PASS</code> и что на роутере разрешён вход по паролю (<code>/ip ssh print</code>)."
+        elif grep -qa "TL_USER совпадает" "$log"; then
+            body+="\n\n💡 Деплой заходит тем же пользователем, которому выдаёт права. Нужен администратор: <code>DEPLOY_TL_USER=admin</code> + <code>DEPLOY_TL_PASS</code>."
+        elif grep -qa "нет SSH-соединения" "$log"; then
+            body+="\n\n💡 Причина: нет SSH-соединения с роутером (порт из devices.conf, сервис ssh, доступность извне)."
+        elif grep -qa "таймаут SSH" "$log"; then
+            body+="\n\n💡 Причина: роутер не ответил вовремя (таймаут SSH)."
+        fi
     fi
     printf '%b' "$body"
 }

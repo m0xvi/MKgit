@@ -570,6 +570,77 @@ ros_ensure_space() {
     return 0
 }
 
+# Выдать недостающие политики через существующий деплой (tg/deploy_key.sh).
+# Правит ТУ группу, в которой пользователь уже состоит; в mikrogit не переводит.
+# rc: 0 — политики в порядке (ничего не делали)
+#     2 — права выданы (деплой отработал)
+#     1 — выдать не удалось / применить нельзя (нет данных, пароля и т. п.)
+router_fix_policies() {
+    [ "${ROUTER_AUTO_FIX_POLICIES:-1}" = "1" ] || return 1
+    [ -f "$SCRIPT_DIR/tg/deploy_key.sh" ] || return 1
+
+    local flags missing="" cur_group="" fixtarget
+    flags=$(ros_user_policy_flags "$DEV_USER" 2>/dev/null)
+    [ -n "$flags" ] || return 1
+    cur_group="${flags%%|*}"
+    case "$flags" in *"ftp=0"*)       missing="$missing ftp" ;; esac
+    case "$flags" in *"sensitive=0"*) missing="$missing sensitive" ;; esac
+    case "$flags" in *"read=0"*)      missing="$missing read" ;; esac
+    [ -n "$missing" ] || return 0       # всё на месте
+
+    if [ -z "${DEPLOY_TL_PASS:-}" ] && [ ! -f "$SCRIPT_DIR/tg/deploy.conf" ]; then
+        warning "$DEV_NAME: пароль администратора не задан (DEPLOY_TL_PASS в tg/tg_bot_config.sh или TL_PASS в tg/deploy.conf) — выдать права автоматически нельзя"
+        return 1
+    fi
+    if [ -n "${DEPLOY_TL_USER:-}" ] && [ "${DEPLOY_TL_USER}" = "$DEV_USER" ]; then
+        warning "$DEV_NAME: DEPLOY_TL_USER совпадает с пользователем бэкапа ($DEV_USER) — он не может выдать права сам себе; укажите администратора"
+        return 1
+    fi
+
+    # правим группу пользователя, а не переводим его в другую
+    fixtarget="${cur_group:-${DEPLOY_TARGET_GROUP-mikrogit}}"
+    if [ -z "$fixtarget" ]; then
+        warning "$DEV_NAME: автовыдача прав отключена (DEPLOY_TARGET_GROUP пуст)"
+        return 1
+    fi
+    local fix_policy="${DEPLOY_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}"
+    case ",$fix_policy," in *,sensitive,*) ;; *) fix_policy="$fix_policy,sensitive" ;; esac
+    case ",$fix_policy," in *,ftp,*) ;; *) fix_policy="$fix_policy,ftp" ;; esac
+
+    warning "$DEV_NAME: не хватает политик:$missing — выдаю права автоматически (tg/deploy_key.sh $DEV_NAME)"
+    local -a fixenv=(
+        DEVICES_CONF="$CONFIG_FILE"
+        TARGET_USER=""
+        TARGET_GROUP="$fixtarget"
+        TARGET_POLICY="$fix_policy"
+        KEY_FILE="${DEPLOY_KEY_FILE:-${SSH_KEY}.pub}"
+        KEY_PRIV="${DEPLOY_KEY_PRIV:-$SSH_KEY}"
+        SSH_PROBE=1
+        SSH_VERIFY=1
+    )
+    # TL_USER/TL_PASS передаём, только если заданы в конфиге бота, — иначе
+    # deploy_key.sh возьмёт их из своего tg/deploy.conf
+    [ -n "${DEPLOY_TL_USER:-}" ] && fixenv+=(TL_USER="$DEPLOY_TL_USER")
+    [ -n "${DEPLOY_TL_PASS:-}" ] && fixenv+=(TL_PASS="$DEPLOY_TL_PASS")
+
+    local drc=0
+    if command -v timeout > /dev/null 2>&1; then
+        env "${fixenv[@]}" timeout "$ROUTER_FIX_TIMEOUT" \
+            bash "$SCRIPT_DIR/tg/deploy_key.sh" "$DEV_NAME" >> "$LOG_FILE" 2>&1 || drc=$?
+    else
+        env "${fixenv[@]}" \
+            bash "$SCRIPT_DIR/tg/deploy_key.sh" "$DEV_NAME" >> "$LOG_FILE" 2>&1 || drc=$?
+    fi
+    if [ "$drc" -eq 0 ]; then
+        info "$DEV_NAME: права обновлены (группа ${fixtarget})"
+        return 2
+    fi
+    warning "$DEV_NAME: автоматически выдать права не удалось (rc=$drc, подробности — $LOG_FILE)"
+    warning "$DEV_NAME: чаще всего нужен администратор: DEPLOY_TL_USER=admin и DEPLOY_TL_PASS в tg/tg_bot_config.sh (или TL_USER/TL_PASS в tg/deploy.conf)"
+    warning "$DEV_NAME: вручную: bash tg/mk_deploy.sh $DEV_NAME"
+    return 1
+}
+
 # --- Backup a single device --------------------------------------------------
 backup_device() {
     local device_name=$1
@@ -685,6 +756,12 @@ backup_device() {
     LAST_BACKUP_FILE="$local_file"
     log "Резервная копия создана на роутере: ${base}.backup"
 
+    # Права проверяем ДО скачивания: без sensitive/ftp scp всё равно не заберёт
+    # .backup, а 15 кругов повторов только мучают роутер. Сразу выдаём права.
+    # 0 = права на месте, 2 = выданы сейчас, 1 = выдать не удалось.
+    local fixrc=0
+    router_fix_policies || fixrc=$?
+
     # --- Скачиваем (роутер пишет файл на flash — с повторами) ----------------
     local i size=0 downloaded=0 tmp="$local_file.part"
     rm -f "$tmp"
@@ -702,74 +779,11 @@ backup_device() {
         rm -f "$tmp"
         [ "$i" -lt "$BACKUP_WAIT_TRIES" ] && sleep "$BACKUP_WAIT_SLEEP"
     done
-
-    # --- Не скачалось из-за прав? Пробуем выдать их автоматически ------------
-    # Используем уже готовый механизм деплоя (tg/deploy_key.sh): он сам
-    # определяет, что ключ работает, заходит админом и ДОБАВЛЯЕТ группе
-    # недостающие политики (ftp, sensitive), не снимая остальные.
-    if [ "$downloaded" != "1" ] && [ "${ROUTER_AUTO_FIX_POLICIES:-1}" = "1" ] && \
-       [ -f "$SCRIPT_DIR/tg/deploy_key.sh" ] && ros_file_exists "${base}.backup"; then
-        local pflags pmissing="" cur_group=""
-        pflags=$(ros_user_policy_flags "$DEV_USER" 2>/dev/null)
-        if [ -n "$pflags" ]; then
-            cur_group="${pflags%%|*}"        # текущая группа пользователя
-            case "$pflags" in *"ftp=0"*)       pmissing="$pmissing ftp" ;; esac
-            case "$pflags" in *"sensitive=0"*) pmissing="$pmissing sensitive" ;; esac
-            case "$pflags" in *"read=0"*)      pmissing="$pmissing read" ;; esac
-        fi
-        # правим ТУ группу, в которой пользователь уже состоит (чтобы деплой не
-        # переводил его в другую); mikrogit — только если группу прочитать не вышло
-        local fix_group="${cur_group:-${DEPLOY_TARGET_GROUP-mikrogit}}"
-        local fix_policy="${DEPLOY_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}"
-        # нам нужны именно sensitive и ftp — добавляем, даже если свой список короче
-        case ",$fix_policy," in *,sensitive,*) ;; *) fix_policy="$fix_policy,sensitive" ;; esac
-        case ",$fix_policy," in *,ftp,*) ;; *) fix_policy="$fix_policy,ftp" ;; esac
-
-        if [ -z "$fix_group" ]; then
-            warning "$DEV_NAME: автовыдача прав отключена (DEPLOY_TARGET_GROUP пуст) — права нужно выдать вручную"
-            pmissing=""
-        fi
-        if [ -n "$pmissing" ]; then
-            warning "$DEV_NAME: не хватает политик:$pmissing — выдаю права автоматически (tg/deploy_key.sh $device_name)"
-            local drc=0
-            if command -v timeout > /dev/null 2>&1; then
-                DEVICES_CONF="$CONFIG_FILE" \
-                TL_USER="${DEPLOY_TL_USER:-${TL_USER:-admin}}" \
-                TL_PASS="${DEPLOY_TL_PASS:-${TL_PASS:-}}" \
-                TARGET_USER="" \
-                TARGET_GROUP="$fix_group" \
-                TARGET_POLICY="$fix_policy" \
-                KEY_FILE="${DEPLOY_KEY_FILE:-${SSH_KEY}.pub}" \
-                KEY_PRIV="${DEPLOY_KEY_PRIV:-$SSH_KEY}" \
-                SSH_PROBE=1 SSH_VERIFY=1 \
-                timeout "$ROUTER_FIX_TIMEOUT" bash "$SCRIPT_DIR/tg/deploy_key.sh" "$device_name" >> "$LOG_FILE" 2>&1 || drc=$?
-            else
-                DEVICES_CONF="$CONFIG_FILE" TL_USER="${DEPLOY_TL_USER:-admin}" \
-                TL_PASS="${DEPLOY_TL_PASS:-${TL_PASS:-}}" TARGET_USER="" \
-                TARGET_GROUP="$fix_group" TARGET_POLICY="$fix_policy" \
-                KEY_FILE="${DEPLOY_KEY_FILE:-${SSH_KEY}.pub}" \
-                KEY_PRIV="${DEPLOY_KEY_PRIV:-$SSH_KEY}" \
-                bash "$SCRIPT_DIR/tg/deploy_key.sh" "$device_name" >> "$LOG_FILE" 2>&1 || drc=$?
-            fi
-            if [ "$drc" -eq 0 ] && ros_wait_file "${base}.backup" 2; then
-                info "$DEV_NAME: права обновлены — пробую скачать ещё раз"
-                rm -f "$tmp"
-                if download_remote_file "$remote_file" "$tmp"; then
-                    size=$(stat -c%s "$tmp" 2>/dev/null || echo 0)
-                    if [ "$size" -ge "$MIN_BACKUP_BYTES" ]; then
-                        mv -f "$tmp" "$local_file"
-                        downloaded=1
-                        info "Скачано после выдачи прав: $(basename "$local_file") ($(bkl_size_h "$local_file"))"
-                    else
-                        rm -f "$tmp"
-                    fi
-                fi
-            elif [ "$drc" -eq 0 ]; then
-                warning "$DEV_NAME: deploy завершился, но файл ${base}.backup уже не найден на роутере"
-            else
-                warning "$DEV_NAME: автоматически выдать права не удалось (rc=$drc, подробности — $LOG_FILE)"
-                warning "$DEV_NAME: вручную: bash tg/mk_deploy.sh $device_name"
-            fi
+    if [ "$downloaded" = "1" ]; then
+        if [ "$fixrc" = "2" ]; then
+            info "Скачано после выдачи прав: $(basename "$local_file") ($(bkl_size_h "$local_file"))"
+        else
+            info "Скачано: $(basename "$local_file") ($(bkl_size_h "$local_file"))"
         fi
     fi
 

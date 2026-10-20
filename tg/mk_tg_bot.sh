@@ -1119,7 +1119,8 @@ show_deploy_menu() {
     [ $count -eq 0 ] && { tg_send_message "$TELEGRAM_CHAT_ID" "No devices configured!"; return 1; }
     keyboard+='[{"text": "🔙 Back", "callback_data": "menu"}]'
     keyboard+=']'
-    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🔑 <b>Деплой ключа MikroGit и прав пользователя</b>\n\n• ставит/обновляет SSH-ключ целевому пользователю (у кого нет);\n• проверяет права НЕ даёт группу full: права доводятся до минимально необходимых — группа <code>mikrogit</code> (создаётся на роутере сама), политики <code>ssh,read,write,test,reboot,policy,ftp,sensitive</code> (ftp — scp/sftp, sensitive — иначе RouterOS не отдаёт .backup); хватает для бэкапов, обновлений и хардненинга;\n• вход на роутер — только по SSH (telnet удалён);\n• работает по одному устройству за раз, по каждому — отчёт.\n\nВыберите действие:" "$keyboard"
+    tg_send_keyboard "$TELEGRAM_CHAT_ID" "🔑 <b>Деплой ключа MikroGit и прав пользователя</b>\n\n• ставит/обновляет SSH-ключ целевому пользователю (у кого нет);\n• проверяет права (группу <code>full</code> не даёт): добавляет недостающие политики <b>в текущую группу</b> пользователя (<code>DEPLOY_TARGET_GROUP=@current</code>, например <code>forbackup</code>) — политики <code>ssh,read,write,test,reboot,policy,ftp,sensitive</code> (ftp — scp/sftp, sensitive — иначе RouterOS не отдаёт .backup); если пользователя ещё нет, создаётся группа <code>mikrogit</code>;\n• для выдачи прав нужен <b>пароль администратора</b>: <code>DEPLOY_TL_USER=admin</code> и <code>DEPLOY_TL_PASS</code> в <code>tg_bot_config.sh</code> (или <code>TL_USER/TL_PASS</code> в <code>tg/deploy.conf</code>) — ограниченный пользователь бэкапа не может выдать политики сам себе;
+• вход на роутер — только по SSH (telnet удалён);\n• работает по одному устройству за раз, по каждому — отчёт.\n\nВыберите действие:" "$keyboard"
 }
 
 ask_deploy_all() {
