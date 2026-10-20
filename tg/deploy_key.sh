@@ -14,8 +14,10 @@
 # ПРАВА: вместо встроенной группы full (все политики) деплой приводит целевого
 # пользователя к отдельной группе TARGET_GROUP (по умолчанию «mikrogit») с
 # МИНИМАЛЬНЫМ набором политик TARGET_POLICY (по умолчанию
-# ssh,read,write,test,reboot,policy,ftp). ftp даёт file-доступ по scp/sftp —
-# без него хардненинг (mk_harden.sh) не сможет залить скрипт на роутер.
+# ssh,read,write,test,reboot,policy,ftp,sensitive). ftp даёт file-доступ по
+# scp/sftp — без него хардненинг (mk_harden.sh) не сможет залить скрипт на
+# роутер, а без sensitive RouterOS не отдаёт по scp/ftp файлы .backup (внутри
+# пароли) — именно из-за этого бэкап «создаётся», но не скачивается.
 # Если группа отсутствует на роутере — она создаётся с этими политиками;
 # существующая группа не переопределяется «вслепую»: добавляются только
 # недостающие требуемые политики (при невозможности прочитать политики группы
@@ -75,8 +77,10 @@ TARGET_GROUP="${TARGET_GROUP-mikrogit}"
 # политики (лишние не снимаются).
 # Минимальный набор, достаточный для задач бота (бэкапы + проверка/установка
 # обновлений RouterOS через сам роутер + RouterBOOT + заливка скрипта
-# хардненинга по scp): ssh,read,write,test,reboot,policy,ftp.
-TARGET_POLICY="${TARGET_POLICY-ssh,read,write,test,reboot,policy,ftp}"
+# хардненинга по scp + скачивание .backup): ssh,read,write,test,reboot,policy,
+# ftp,sensitive. sensitive обязателен: .backup помечен как sensitive, и без
+# этой политики RouterOS не отдаёт его по scp/sftp/ftp.
+TARGET_POLICY="${TARGET_POLICY-ssh,read,write,test,reboot,policy,ftp,sensitive}"
 NEWUSER_PASS="${NEWUSER_PASS:-}"     # пароль для СОЗДАВАЕМОГО пользователя (если TARGET_USER не существует)
 SSH_PROBE="${SSH_PROBE:-1}"          # проверять ли вход целевым SSH-ключом (1/0); 0 = всегда полный прогон
 SSH_TIMEOUT="${SSH_TIMEOUT:-8}"      # таймаут SSH-проверки на устройство, сек
@@ -293,7 +297,7 @@ ssh_group_policy_of_user() {
 
 
 # Список требуемых политик (для точной проверки прав пользователя)
-need_policies() { echo "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp}"; }
+need_policies() { echo "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}"; }
 
 # Покрывает ли список политик $1 (через запятую) все требуемые из $2.
 pol_has_all() {
@@ -381,7 +385,7 @@ deploy_one() {
     # $1 host  $2 ssh-порт  $3 target  $4 rights_only  $5 npass (для нового user)
     local host="$1" sport="$2" target="$3" ro="$4" npass="$5"
     local req_pol tgroup
-    req_pol="$(printf '%s' "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp}" | tr -d ' \t' | tr ';' ',')"
+    req_pol="$(printf '%s' "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}" | tr -d ' \t' | tr ';' ',')"
     tgroup="${TARGET_GROUP:-}"
 
     # ssh-exec одной строкой (без pty); вывод в ADM_OUT/ADM_RC

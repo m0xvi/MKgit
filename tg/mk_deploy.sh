@@ -6,7 +6,8 @@
 #   - запуск deploy_key.sh (SSH) по устройствам из devices.conf —
 #     установка SSH-ключа MikroGit целевому пользователю + проверка и доводка
 #     прав до МИНИМАЛЬНОЙ группы (DEPLOY_TARGET_GROUP, по умолчанию mikrogit,
-#     политики ssh,read,write,test,reboot,policy,ftp) — прямо из бота или консоли:
+#     политики ssh,read,write,test,reboot,policy,ftp,sensitive) — прямо из бота
+#     или консоли:
 #        bash tg/mk_deploy.sh all
 #        bash tg/mk_deploy.sh <device>
 #        bash tg/mk_deploy.sh status
@@ -43,10 +44,12 @@ DEPLOY_TARGET_USER="${DEPLOY_TARGET_USER:-}"
 # отдельная группа с МИНИМАЛЬНЫМ набором политик (DEPLOY_TARGET_POLICY);
 # на роутере группа создаётся автоматически, если её нет. Пусто = права не менять.
 DEPLOY_TARGET_GROUP="${DEPLOY_TARGET_GROUP:-mikrogit}"
-# Политики группы (применяются при СОЗДАНИИ группы). Минимум для задач бота
-# (бэкап + проверка/установка обновлений RouterOS через роутер): ssh,read,
-# write,test,reboot,policy.
-DEPLOY_TARGET_POLICY="${DEPLOY_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp}"
+# Политики группы (применяются при СОЗДАНИИ группы; у существующей группы
+# недостающие политики ДОБАВЛЯЮТСЯ). Минимум для задач бота (бэкап + скачивание
+# .backup + проверка/установка обновлений RouterOS через роутер):
+# ssh,read,write,test,reboot,policy,ftp,sensitive.
+# sensitive обязателен — без него RouterOS не отдаёт .backup по scp/ftp.
+DEPLOY_TARGET_POLICY="${DEPLOY_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}"
 # Пароль для создаваемого пользователя (пусто = случайный, будет в логе)
 DEPLOY_NEWUSER_PASS="${DEPLOY_NEWUSER_PASS:-}"
 

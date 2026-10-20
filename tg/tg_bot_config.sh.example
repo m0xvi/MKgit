@@ -129,13 +129,16 @@ export DEPLOY_TL_PASS=""
 
 # Группа прав пользователя после деплоя. Вместо full — отдельная группа
 # «mikrogit» с МИНИМАЛЬНО необходимыми политиками (DEPLOY_TARGET_POLICY).
-# Если группы на роутере нет — deploy_key.sh создаст её сам. Политики
-# существующей группы не меняются. Пусто = НЕ менять права, только показать.
+# Если группы на роутере нет — deploy_key.sh создаст её сам; у существующей
+# группы недостающие политики добавляются (лишние не снимаются).
+# Пусто = НЕ менять права, только показать.
 export DEPLOY_TARGET_GROUP="mikrogit"
-# Политики группы DEPLOY_TARGET_GROUP (используются при её создании).
-# ssh,read,write,test,reboot,policy — минимум, при котором работают бэкапы и
-# установка обновлений RouterOS из самого роутера. Меняйте осознанно.
-export DEPLOY_TARGET_POLICY="ssh,read,write,test,reboot,policy,ftp"
+# Политики группы DEPLOY_TARGET_GROUP. Минимум для работы бота:
+#   ssh,read,write,test,reboot,policy — бэкапы и обновления RouterOS;
+#   ftp      — scp/sftp (хардненинг, скачивание файлов);
+#   sensitive— ОБЯЗАТЕЛЬНО для .backup: без неё RouterOS не отдаёт файл
+#              по scp/ftp, и бэкап «создаётся, но не скачивается».
+export DEPLOY_TARGET_POLICY="ssh,read,write,test,reboot,policy,ftp,sensitive"
 # Целевой пользователь (пусто = пользователь из 4-го поля devices.conf)
 export DEPLOY_TARGET_USER=""
 # Пароль для СОЗДАВАЕМОГО пользователя (пусто = случайный, будет в логе)
