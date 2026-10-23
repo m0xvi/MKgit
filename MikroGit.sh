@@ -459,8 +459,9 @@ ros_user_policy_list() {
     local user="${1:-$DEV_USER}" out
     [ -n "$user" ] || return 1
     out=$(ros_ssh ":local u [/user find where name=\"$user\"]; :local g [/user get \$u group]; :put [/user group get [find where name=\$g] policy]" 30)
-    out=$(printf '%s' "$out" | tr -d '\r\n ')
-    case "$out" in ''|*[!a-z,-]*) return 1 ;; esac
+    # RouterOS 6 печатает список через ";" и с переносами, запреты — с "!"
+    out=$(printf '%s' "$out" | tr -d '\r\n\t ' | tr ';' ',' | sed -E 's/^,+//; s/,+$//; s/,,+/,/g')
+    case "$out" in ''|*[!a-z,!-]*) return 1 ;; esac
     printf '%s' "$out"
 }
 
@@ -616,7 +617,8 @@ router_self_grant_policies() {
     [ "${ROUTER_SELF_GRANT:-1}" = "1" ] || return 1
     [ -f "$SCRIPT_DIR/tg/fix_rights_self.sh" ] || return 1
     local out rc=0 policy
-    policy="${DEPLOY_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}"
+    # reboot не трогаем: для .backup он не нужен, а где-то осознанно запрещён
+    policy="${ROUTER_SELF_GRANT_POLICY:-ssh,read,write,test,policy,ftp,sensitive}"
     case ",$policy," in *,sensitive,*) ;; *) policy="$policy,sensitive" ;; esac
     case ",$policy," in *,ftp,*) ;; *) policy="$policy,ftp" ;; esac
 
@@ -850,6 +852,20 @@ backup_device() {
         rm -f "$tmp"
         [ "$i" -lt "$BACKUP_WAIT_TRIES" ] && sleep "$BACKUP_WAIT_SLEEP"
     done
+    # Только что выдали политики — RouterOS применяет их к НОВОМУ входу, но на
+    # всякий случай даём ему пару секунд и пробуем ещё раз (без долгих циклов).
+    if [ "$downloaded" != "1" ] && [ "$fixrc" = "2" ] && ros_file_exists "${base}.backup"; then
+        sleep 5
+        rm -f "$tmp"
+        if download_remote_file "$remote_file" "$tmp"; then
+            size=$(stat -c%s "$tmp" 2>/dev/null || echo 0)
+            if [ "$size" -ge "$MIN_BACKUP_BYTES" ]; then
+                mv -f "$tmp" "$local_file"; downloaded=1
+            else
+                rm -f "$tmp"
+            fi
+        fi
+    fi
     if [ "$downloaded" = "1" ]; then
         if [ "$fixrc" = "2" ]; then
             info "Скачано после выдачи прав: $(basename "$local_file") ($(bkl_size_h "$local_file"))"

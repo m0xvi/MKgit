@@ -25,7 +25,8 @@
 #   CONFIG_FILE   — devices.conf (по умолчанию рядом с репозиторием)
 #   SSH_KEY       — приватный ключ (по умолчанию ~/.ssh/mk_key)
 #   SSH_TIMEOUT   — таймаут подключения, сек (по умолчанию 10)
-#   TARGET_POLICY — какие политики должны быть (по умолчанию полный набор)
+#   TARGET_POLICY — какие политики обязаны быть (по умолчанию
+#                   ssh,read,write,test,policy,ftp,sensitive — без reboot)
 #   MK_SSH_BIN    — бинарь ssh (для тестов)
 #
 # Коды возврата:
@@ -35,6 +36,8 @@
 #   1 — прочая ошибка (в т.ч. нет SSH-соединения — текст в выводе)
 # В режиме -all: 0, если хотя бы одному устройству помогли/всё уже было;
 # 3, если все упираются в отсутствие policy; иначе 1.
+# Режим --check ничего не меняет: 0 = отчёт выдан, 3 = есть устройства,
+# которым нужен администратор (у них нет policy/write).
 # =============================================================================
 set -uo pipefail
 
@@ -44,7 +47,9 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-${DEVICES_CONF:-$ROOT_DIR/devices.conf}}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/mk_key}"
 SSH_TIMEOUT="${SSH_TIMEOUT:-10}"
-TARGET_POLICY="${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}"
+# Какие политики обязаны быть у группы. reboot намеренно НЕ входит: он не
+# нужен для .backup, а у части роутеров он осознанно запрещён (!reboot).
+TARGET_POLICY="${TARGET_POLICY:-ssh,read,write,test,policy,ftp,sensitive}"
 SSH_BIN="${MK_SSH_BIN:-ssh}"
 CHECK_ONLY=0
 
@@ -81,12 +86,30 @@ ros_exec() {
         "$user@$host" "$cmd" 2>&1 < /dev/null | tr -d '\r'
 }
 
-# Нормализация списка политик: без пробелов, через запятую, без пустых.
+# Нормализация списка политик: без пробелов/переносов, через запятую.
+# RouterOS печатает длинный список с переносами и отступами, а запрещённые
+# политики — со знаком "!" впереди (например: ssh;ftp;!local;!sensitive).
+# Поэтому: убираем любые пробелы/переводы строк, ";" заменяем на ",".
 norm_pol() {
-    printf '%s' "$1" | tr -d ' \t' | tr ';' ',' | sed -E 's/^,+//; s/,+$//; s/,,+/,/g'
+    printf '%s' "$1" | tr -d ' \t\r\n' | tr ';' ',' \
+        | sed -E 's/^,+//; s/,+$//; s/,,+/,/g'
 }
 
-# Политики из $1, которых нет в $2 (список через запятую).
+# Вытащить из произвольного вывода RouterOS сам список политик.
+# Берём самый длинный фрагмент из допустимых символов, содержащий разделитель.
+parse_pol() {
+    local flat cand
+    flat=$(printf '%s' "$1" | tr -d ' \t\r\n')
+    cand=$(printf '%s\n' "$flat" \
+        | grep -oE '[A-Za-z!][A-Za-z0-9!;,_-]+' 2>/dev/null \
+        | awk 'index($0,";") || index($0,",")' \
+        | awk '{print length($0)"\t"$0}' \
+        | sort -rn | head -1 | cut -f2-)
+    printf '%s' "$(norm_pol "$cand")"
+}
+
+# Политики из $2 (требуемые), которых НЕТ в $1 (текущие).
+# Запрет "!sensitive" также считается отсутствием.
 missing_pol() {
     local have=",$(norm_pol "$1")," want="$2" tok miss=""
     local IFS=,
@@ -100,10 +123,36 @@ missing_pol() {
     printf '%s' "$miss"
 }
 
+# Слить текущий список с недостающими политиками.
+# Разрешающие политики сохраняются, запреты "!X" для выдаваемых X снимаются,
+# недостающие X добавляются в конец. Разделитель для RouterOS — запятая.
+merge_pol() {
+    local cur="$1" miss="$2" tok want out="" drop
+    local -a toks=() kept=() wants=()
+    local IFS=','
+    for tok in $cur; do [ -n "$tok" ] && toks+=("$tok"); done
+    IFS=' ' read -r -a wants <<< "$(printf '%s' "$miss" | tr ',' ' ')"
+    for tok in "${toks[@]}"; do
+        drop=0
+        for want in "${wants[@]}"; do
+            [ "$tok" = "!$want" ] && drop=1
+        done
+        [ "$drop" = "0" ] && kept+=("$tok")
+    done
+    for want in "${wants[@]}"; do
+        [ -n "$want" ] && kept+=("$want")
+    done
+    for tok in "${kept[@]}"; do
+        if [ -n "$out" ]; then out="$out,$tok"; else out="$tok"; fi
+    done
+    printf '%s' "$out"
+}
+
 RESULT_FIXED=0
 RESULT_CANNOT=0
 RESULT_OK=0
 RESULT_DOWN=0
+RESULT_NEED=0
 
 process_one() {
     local name="$1" ip="" port="" user="" line group pol miss cmd out rc
@@ -130,12 +179,11 @@ process_one() {
     # 2) политики группы
     out=$(ros_exec "$ip" "$port" "$user" ":put [/user group get [find name=$group] policy]")
     rc=$?
-    pol=$(printf '%s\n' "$out" | tr -d '\r' | grep -E '^"?[A-Za-z][A-Za-z0-9,; _-]*"?$' | tail -1 | tr -d '"')
+    pol=$(parse_pol "$out")
     if [ "$rc" -ne 0 ] || [ -z "$pol" ]; then
-        echo "[ERR] $name: не удалось прочитать политики группы '$group': $(printf '%s' "$out" | tail -1)"
+        echo "[ERR] $name: не удалось прочитать политики группы '$group': $(printf '%s' "$out" | tr -d '\r' | tr -s ' \n' ' ' | cut -c1-300)"
         return 3
     fi
-    pol=$(norm_pol "$pol")
     miss=$(missing_pol "$pol" "$TARGET_POLICY")
 
     if [ -z "$miss" ]; then
@@ -146,11 +194,13 @@ process_one() {
 
     if [ "$CHECK_ONLY" = "1" ]; then
         echo "[WARN] $name: нужны политики: $miss (режим --check, ничего не меняю)"
-        return 3
+        return 4
     fi
 
     # 3) добавляем недостающие (лишние не снимаем, группу не меняем)
-    cmd="/user group set [find name=$group] policy=$pol,$miss"
+    local merged
+    merged="$(merge_pol "$pol" "$miss")"
+    cmd="/user group set [find name=$group] policy=$merged"
     out=$(ros_exec "$ip" "$port" "$user" "$cmd")
     rc=$?
     if [ "$rc" -ne 0 ] || printf '%s' "$out" | grep -qiE 'not enough permissions|permission denied|denied|failure|no such item|invalid|error'; then
@@ -167,8 +217,7 @@ process_one() {
 
     # 4) проверяем результат новым подключением
     out=$(ros_exec "$ip" "$port" "$user" ":put [/user group get [find name=$group] policy]")
-    pol=$(printf '%s\n' "$out" | tr -d '\r' | grep -E '^"?[A-Za-z][A-Za-z0-9,; _-]*"?$' | tail -1 | tr -d '"')
-    pol=$(norm_pol "$pol")
+    pol=$(parse_pol "$out")
     miss=$(missing_pol "$pol" "$TARGET_POLICY")
     if [ -n "$miss" ]; then
         echo "[ERR] $name: политики не применились, всё ещё нет: $miss"
@@ -189,6 +238,7 @@ while IFS=: read -r name _; do
     case $? in
         0)  RESULT_OK=$((RESULT_OK + 1)) ;;
         10) RESULT_OK=$((RESULT_OK + 1)); RESULT_FIXED=$((RESULT_FIXED + 1)) ;;
+        4)  RESULT_NEED=$((RESULT_NEED + 1)) ;;
         3)  RESULT_CANNOT=$((RESULT_CANNOT + 1)); status=3 ;;
         2)  RESULT_DOWN=$((RESULT_DOWN + 1)); [ "$status" -eq 0 ] && status=1 ;;
         *)  status=1 ;;
@@ -198,7 +248,14 @@ done < "$CONFIG_FILE"
 [ "$found" -gt 0 ] || { echo "[ERR] устройство '$FILTER' не найдено в $CONFIG_FILE"; exit 1; }
 
 # Итог одной строкой — удобно для парсинга в MikroGit.sh / боте
-echo "ИТОГ: в порядке/выдано $RESULT_OK (из них выдано сейчас $RESULT_FIXED), нельзя без админа $RESULT_CANNOT, нет связи $RESULT_DOWN"
+echo "ИТОГ: в порядке/выдано $RESULT_OK (из них выдано сейчас $RESULT_FIXED), нужно поправить $RESULT_NEED, нельзя без админа $RESULT_CANNOT, нет связи $RESULT_DOWN"
 if [ "$RESULT_OK" -gt 0 ]; then exit 0; fi
+if [ "$CHECK_ONLY" = "1" ]; then
+    # отчёт: 0 = всё понятно (даже если что-то нужно поправить),
+    # 3 = есть устройства, где без администратора не обойтись
+    [ "$RESULT_CANNOT" -gt 0 ] && exit 3
+    [ "$RESULT_DOWN" -gt 0 ] && exit 1
+    exit 0
+fi
 [ "$status" -eq 0 ] && status=3
 exit "$status"

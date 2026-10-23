@@ -78,6 +78,8 @@ TARGET_GROUP_FALLBACK="${TARGET_GROUP_FALLBACK:-mikrogit}"
 # Скрипт «выдать права ключом самого пользователя» (рядом с deploy_key.sh)
 SELF_FIX_SCRIPT="${SELF_FIX_SCRIPT:-$SCRIPT_DIR/fix_rights_self.sh}"
 SELF_GRANT="${SELF_GRANT:-1}"
+# Что добавляем без администратора (reboot не трогаем — он не нужен для бэкапа)
+SELF_GRANT_POLICY="${SELF_GRANT_POLICY:-ssh,read,write,test,policy,ftp,sensitive}"
 SELF_GRANT_WHY=""
 # Политики группы TARGET_GROUP. Если группы на роутере ещё нет — она создаётся
 # с этими политиками; если уже есть — в неё ДОБАВЛЯЮТСЯ недостающие требуемые
@@ -295,7 +297,10 @@ ssh_group_policy_of_user() {
         -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout="$SSH_TIMEOUT" -o LogLevel=ERROR \
         "$target@$host" ":put [/user group get [find name=$g] policy]" 2>/dev/null < /dev/null)
-    pol=$(printf '%s' "$out" | tr -d '\r' | grep -E '^"?[a-zA-Z][a-zA-Z0-9,; _-]*"?$' | tail -n1 | tr -d '"' | tr ';' ',' | tr -d ' ')
+    # RouterOS печатает список с переносами/отступами и "!" перед запретами
+    pol=$(printf '%s' "$out" | tr -d ' \t\r\n' | tr ';' ',' | tr -d '"')
+    # отбрасываем мусор (если пришло что-то кроме списка политик)
+    case "$pol" in *[!A-Za-z0-9!,_-]*) pol="" ;; esac
     if [ -n "$pol" ]; then
         printf '%s\n' "$pol"
         return 0
@@ -454,7 +459,11 @@ deploy_one() {
         [ -z "$g" ] && return 1
         adm ":put [/user group get [find name=$g] policy]"
         if [ "$ADM_RC" = "0" ]; then
-            p="$(printf '%s\n' "$ADM_OUT" | tr -d '\r' | grep -E '^"?[A-Za-z][A-Za-z0-9,; _-]*"?$' | tail -n1 | tr -d '"')"
+            p="$(printf '%s' "$ADM_OUT" | tr -d ' \t\r\n' | tr ';' ',' | tr -d '"')"
+            # если в выводе есть мусор — берём только допустимые символы
+            case "$p" in
+                *[!A-Za-z0-9!,_-]*) p="" ;;
+            esac
         fi
         if [ -z "$p" ]; then
             adm "/user group print detail where name=$g"
@@ -787,7 +796,7 @@ while IFS=':' read -r name ip port user desc; do
     if [ "$rights_only" = "1" ] && [ -f "$SELF_FIX_SCRIPT" ] && [ "${SELF_GRANT:-1}" = "1" ]; then
         sg=0; sgout=""
         sgout=$(DEVICES_CONF="$DEVICES_CONF" SSH_KEY="$KEY_PRIV" \
-                SSH_TIMEOUT="${SSH_TIMEOUT:-10}" TARGET_POLICY="$(need_policies)" \
+                SSH_TIMEOUT="${SSH_TIMEOUT:-10}" TARGET_POLICY="$SELF_GRANT_POLICY" \
                 MK_SSH_BIN="${MK_SSH_BIN:-ssh}" \
                 bash "$SELF_FIX_SCRIPT" "$name" 2>&1) || sg=$?
         case "$sg" in

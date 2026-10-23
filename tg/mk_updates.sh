@@ -446,7 +446,7 @@ rup_rights_preflight() {
     out=$(CONFIG_FILE="$(rup_cfg_file)" \
           SSH_KEY="${SSH_KEY:-$HOME/.ssh/mk_key}" \
           SSH_TIMEOUT="${UPDATE_SSH_TIMEOUT:-60}" \
-          TARGET_POLICY="${UPDATE_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}" \
+          TARGET_POLICY="${UPDATE_TARGET_POLICY:-ssh,read,write,test,policy,ftp,sensitive}" \
           bash "$script" "$name" 2>&1) || rc=$?
     case "$rc" in
         0) printf '%s\n' "$out" | grep -q 'политики добавлены' && \
