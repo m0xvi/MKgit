@@ -200,7 +200,6 @@ tg_test_connection() {
     return 1
 }
 
-tg_api_log "INFO" "Helpers loaded. proxy=${
-    https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-DIRECT}}}
-}"
+_mk_proxy="${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}"
+tg_api_log "INFO" "Helpers loaded. proxy=${_mk_proxy:-DIRECT}"
 
