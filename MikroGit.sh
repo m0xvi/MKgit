@@ -274,10 +274,12 @@ ros_ssh() {
         -o ServerAliveInterval=20 -o ServerAliveCountMax=20
         -o LogLevel=ERROR
     )
+    # RouterOS отдаёт CRLF: без чистки "\r" попадает в лог и (через printf %b)
+    # ломает строки — лог перемешивается.
     if [ -n "$tmo" ] && command -v timeout > /dev/null 2>&1; then
-        timeout "$tmo" ssh "${opts[@]}" "$DEV_USER@$DEV_IP" "$cmd" 2>&1
+        timeout "$tmo" ssh "${opts[@]}" "$DEV_USER@$DEV_IP" "$cmd" 2>&1 | tr -d '\r'
     else
-        ssh "${opts[@]}" "$DEV_USER@$DEV_IP" "$cmd" 2>&1
+        ssh "${opts[@]}" "$DEV_USER@$DEV_IP" "$cmd" 2>&1 | tr -d '\r'
     fi
 }
 
@@ -413,6 +415,35 @@ ros_file_exists_loose() {
     local want="$1"
     [ -n "$want" ] || return 1
     ros_ssh "/file print" 30 | grep -qF "$want"
+}
+
+# Что именно случилось с доступом к роутеру — по тексту ошибки ssh
+# (+ ping как подсказка). Печатает короткое объяснение для лога/Telegram.
+net_diag() {
+    local ip="$1" port="$2" err="${3:-}" ping_ok=0
+    command -v ping > /dev/null 2>&1 && ping -c1 -W2 "$ip" > /dev/null 2>&1 && ping_ok=1
+    case "$err" in
+        *"Connection timed out"*|*"Operation timed out"*)
+            if [ "$ping_ok" = "1" ]; then
+                echo "хост отвечает на ping, но порт $port не открывается — фильтр/firewall или ssh на другом порту"
+            else
+                echo "роутер $ip не отвечает вообще (ни ping, ни порт $port) — питание, канал/маршрут или адрес сменился"
+            fi ;;
+        *"Connection refused"*)
+            echo "хост доступен, но порт $port закрыт — ssh выключен или порт в devices.conf не тот" ;;
+        *"No route to host"*)
+            echo "нет маршрута до $ip — другая подсеть/VLAN или адрес сменился" ;;
+        *"Connection reset"*|*"Connection closed"*|*"kex_exchange"*)
+            echo "на порту $port кто-то есть, но это не SSH RouterOS — проверьте порт в devices.conf" ;;
+        *"Permission denied"*|*"publickey"*)
+            echo "ключ не принят — посмотрите /user ssh-keys print на роутере" ;;
+        *)
+            if [ "$ping_ok" = "1" ]; then
+                echo "хост $ip отвечает на ping, но SSH-сессия не поднялась"
+            else
+                echo "нет связи с $ip:$port — питание, канал или адрес"
+            fi ;;
+    esac
 }
 
 # Ждать появления файла (роутер пишет на flash не мгновенно)
@@ -740,7 +771,9 @@ backup_device() {
     local out
     out=$(ros_ssh "/system identity print" 30)
     if ros_output_is_error "$out" || [ -z "$out" ]; then
-        BACKUP_ERROR="нет SSH-доступа к $DEV_IP:$DEV_PORT: $(printf '%s' "$out" | tail -2 | tr '\n' ' ' | cut -c1-160)"
+        local why_net
+        why_net="$(net_diag "$DEV_IP" "$DEV_PORT" "$out")"
+        BACKUP_ERROR="нет SSH-доступа к $DEV_IP:$DEV_PORT: $(printf '%s' "$out" | tail -1 | tr -d '\r' | cut -c1-120) [$why_net]"
         error "Cannot connect to $device_name ($DEV_IP:$DEV_PORT): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')"
         return 1
     fi

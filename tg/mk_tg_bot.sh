@@ -692,6 +692,8 @@ log_sanitize() {
                 [ -n "$s" ] && line="${line//"$s"/[SCRUBBED]}"
             done <<< "$svals"
         fi
+        # Логин:пароль внутри proxy/URL — не показываем никогда
+        line="$(printf '%s' "$line" | sed -E 's#(://)[^/@[:space:]]+:[^/@[:space:]]*@#\1***@#g')"
         # ANSI-цвета из логов (иначе в Telegram видно «[1;33m»)
         line="$(printf '%s' "$line" | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g; s/\x1b\[[0-9;]*[A-Za-z]//g')"
         # Сгенерированные пароли вида mk-<epoch>-<random>

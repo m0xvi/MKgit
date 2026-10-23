@@ -433,6 +433,28 @@ rup_tsv_escape_detail() {
 # Печатает TSV-строку:
 #   name<TAB>status<TAB>major<TAB>installed<TAB>latest<TAB>channel<TAB>detail
 # где status: UPDATE | CURRENT | BUSY | ERROR
+# Есть ли у пользователя право /system reboot. Без него обновление RouterOS
+# не завершится: пакет скачается, но роутер сам не перезагрузится.
+# rc: 0 — reboot разрешён; 1 — запрещён/неизвестно (текст причины в $RUP_REBOOT_WHY)
+RUP_REBOOT_WHY=""
+rup_has_reboot_policy() {
+    local name="$1" line user out pol
+    RUP_REBOOT_WHY=""
+    line=$(rup_get_line "$name") || return 1
+    IFS=':' read -r _ _ _ user _ <<< "$line"
+    out=$(rup_ssh_exec "$name" ":local u [/user find where name=\"$user\"]; :local g [/user get \$u group]; :put [/user group get [find name=\$g] policy]" "${UPDATE_SSH_TIMEOUT:-60}") || {
+        RUP_REBOOT_WHY="не удалось прочитать политики"
+        return 1
+    }
+    # RouterOS 6: список через ";" и с переносами, запреты — "!reboot"
+    pol=$(printf '%s' "$out" | tr -d ' \t\r\n' | tr ';' ',')
+    case ",$pol," in
+        *",reboot,"*) return 0 ;;
+    esac
+    RUP_REBOOT_WHY="в группе пользователя нет политики reboot"
+    return 1
+}
+
 # --- Права пользователя бэкапа: довести недостающие политики ----------------
 # Обновлениям нужны write/test/reboot/policy. Если группа пользователя не
 # содержит policy, права выдаёт администратор (DEPLOY_TL_PASS); если содержит —
@@ -777,6 +799,14 @@ rup_worker_apply() {
     # 4. Скачивание
     rup_send "⬇️ <b>$name</b>: скачиваю RouterOS $latest (канал ${chan:-?}).\nЭто может занять несколько минут…"
     local out rc
+    # 4a. Право на reboot: без него пакет скачается, но установка не завершится
+    if ! rup_has_reboot_policy "$name"; then
+        rup_send "⏸ <b>$name</b>: обновление НЕ начинаю — ${RUP_REBOOT_WHY:-нет права на перезагрузку}.\nБез <code>reboot</code> роутер не перезагрузится сам, и новый RouterOS не встанет.\nВключить: <code>/user group set [find name=<группа>] policy=<текущие>,reboot</code> — или обновите устройство вручную (Winbox/консоль)."
+        rup_note_error "$name" "нет политики reboot у пользователя — установка не начнётся"
+        rup_log "apply $name: пропуск — ${RUP_REBOOT_WHY}"
+        rup_lock_release "apply_$name"; trap - EXIT; return 1
+    fi
+
     out=$(rup_ssh_exec "$name" "/system package update download" "${UPDATE_DOWNLOAD_TIMEOUT:-900}")
     rc=$?
 
