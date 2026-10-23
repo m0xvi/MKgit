@@ -7,6 +7,7 @@
 #   • права на запись в logs/, bckp/ и на .git (git fetch → Permission denied);
 #   • живой SSH-ключ из конфига и его доступность;
 #   • процессы бота/планировщика и занятость локов;
+#   • синтаксис скриптов и загрузку библиотек (бот падал из-за «bad substitution»);
 #   • состояние systemd-сервисов (если установлены);
 #   • мусор в домашнем каталоге (~/deploy_key_*.log, ~/mikrotik_backup.log);
 #   • настройки расписания и последние бэкапы.
@@ -226,8 +227,38 @@ for d in update_state deploy_state harden_state schedule; do
     done
 done
 
-# --- 6. systemd ---------------------------------------------------------------
-sec "6. systemd"
+# --- 6. Скрипты: синтаксис и загрузка библиотек -------------------------------
+# bash -n НЕ ловит ошибки раскрытия (например, «bad substitution»), из-за
+# которых скрипт падает уже на сервере — поэтому проверяем ещё и source.
+sec "6. Скрипты (синтаксис и загрузка)"
+DK_SYNTAX_BAD=""
+for f in "$DK_REPO_DIR/MikroGit.sh" "$DK_SELF_DIR"/*.sh; do
+    [ -f "$f" ] || continue
+    bash -n "$f" 2>/dev/null || DK_SYNTAX_BAD="$DK_SYNTAX_BAD $(basename "$f")"
+done
+if [ -n "$DK_SYNTAX_BAD" ]; then
+    bad "синтаксис: ошибка в$DK_SYNTAX_BAD"
+else
+    ok "синтаксис всех скриптов в порядке (bash -n)"
+fi
+# многострочное ${…} — частая причина «bad substitution»
+DK_MULTI=$(grep -rln '${$' "$DK_SELF_DIR"/*.sh "$DK_REPO_DIR/MikroGit.sh" 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')
+[ -n "$DK_MULTI" ] && bad "перенос строки внутри \${…}: $DK_MULTI" \
+                   || ok "многострочных \${…} нет"
+# библиотека хелперов должна загружаться (иначе бот падает сразу)
+if ( set -e; LOG_FILE=/dev/null; source "$DK_SELF_DIR/tg_api_helpers.sh" ) >/dev/null 2>&1; then
+    ok "tg_api_helpers.sh загружается"
+else
+    bad "tg_api_helpers.sh не загружается — бот не стартует (bash -x tg/tg_api_helpers.sh)"
+fi
+if ( set -e; LOG_FILE=/dev/null; source "$DK_SELF_DIR/mk_backup_lib.sh" ) >/dev/null 2>&1; then
+    ok "mk_backup_lib.sh загружается"
+else
+    bad "mk_backup_lib.sh не загружается"
+fi
+
+# --- 7. systemd ---------------------------------------------------------------
+sec "7. systemd"
 if command -v systemctl > /dev/null 2>&1; then
     for u in mkgit-bot mkgit-schedule; do
         if systemctl list-unit-files 2>/dev/null | grep -q "^$u.service"; then
@@ -241,16 +272,16 @@ else
     warn "systemctl недоступен"
 fi
 
-# --- 7. Мусор в домашнем каталоге --------------------------------------------
-sec "7. Мусор в $HOME"
+# --- 8. Мусор в домашнем каталоге --------------------------------------------
+sec "8. Мусор в $HOME"
 DKJ=$(find "$HOME" -maxdepth 1 -name 'deploy_key_*.log' 2>/dev/null | wc -l)
 [ "$DKJ" -gt 0 ] && warn "~/deploy_key_*.log: $DKJ шт. (чистятся автоматически, старше MKC_HOME_LOG_DAYS)" \
                  || ok "старых deploy_key-логов нет"
 [ -f "$HOME/mikrotik_backup.log" ] && warn "устаревший ~/mikrotik_backup.log (переносится в logs/legacy/)" \
                                   || ok "~/mikrotik_backup.log отсутствует"
 
-# --- 8. Бэкапы и расписание ---------------------------------------------------
-sec "8. Бэкапы и расписание"
+# --- 9. Бэкапы и расписание ---------------------------------------------------
+sec "9. Бэкапы и расписание"
 if [ -d "$DK_BCK_DIR" ]; then
     DEV_DIRS=$(find "$DK_BCK_DIR" -mindepth 1 -maxdepth 1 -type d ! -name pre_update 2>/dev/null | wc -l)
     BK=$(find "$DK_BCK_DIR" -mindepth 2 -maxdepth 2 -type f -name '*.backup' 2>/dev/null | wc -l)

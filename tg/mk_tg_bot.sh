@@ -1789,10 +1789,14 @@ run_bot() {
     # Исключаем запуск второй копии бота
     ensure_single_instance
 
-    # Test connection first
-    if ! tg_test_connection; then
-        error "Cannot reach Telegram API. Check proxy settings. Exiting."
-        exit 1
+    # Test connection first (start_bot_with_ssh.sh уже проверил — не дублируем)
+    if [ "${MK_BOT_SKIP_TEST:-0}" != "1" ]; then
+        if ! tg_test_connection; then
+            error "Cannot reach Telegram API. Check proxy settings. Exiting."
+            exit 1
+        fi
+    else
+        log "Проверка Telegram API уже выполнена при старте — пропускаю"
     fi
 
     tg_send_message "$TELEGRAM_CHAT_ID" "🤖 <b>MikroTik Backup Bot started!</b>"

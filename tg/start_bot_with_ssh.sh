@@ -93,7 +93,11 @@ ssh -T git@github.com 2>&1 | head -1 || echo "[$(date)] GitHub connection test c
 # --- Test Telegram API connection (via proxy) ---
 echo "[$(date)] Testing Telegram API connection..."
 # shellcheck source=tg_api_helpers.sh
-source "$SCRIPT_DIR/tg_api_helpers.sh"
+if ! source "$SCRIPT_DIR/tg_api_helpers.sh"; then
+    echo "ERROR: не удалось загрузить $SCRIPT_DIR/tg_api_helpers.sh" >&2
+    echo "       проверьте: bash -n $SCRIPT_DIR/tg_api_helpers.sh && bash tg/mkgit_doctor.sh" >&2
+    exit 1
+fi
 if tg_test_connection; then
     echo "[$(date)] Telegram API connection OK"
 else
