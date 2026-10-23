@@ -123,11 +123,17 @@ bkl_reason_hint() {
     local r="${1:-}"
     [ -n "$r" ] || return 0
     case "$r" in
+        *"нужен администратор"*)
+            echo "в группе пользователя нет политики policy — права может добавить только администратор: DEPLOY_TL_USER=admin и DEPLOY_TL_PASS в tg_bot_config.sh, затем bash tg/mk_deploy.sh <устройство>; либо добавьте policy в группу на роутере" ;;
         *"нет политик"*|*"scp/sftp не может"*)
-            echo "RouterOS не отдаёт .backup без политики sensitive — скрипт выдаёт её сам; если не вышло: кнопка «🔧 Исправить права» или bash tg/mk_deploy.sh <устройство>" ;;
+            echo "RouterOS не отдаёт .backup без политик sensitive и ftp. Скрипт выдаёт их сам (ключом пользователя, без админа): bash tg/fix_rights_self.sh <устройство>; если в группе нет policy — нужен администратор: bash tg/mk_deploy.sh <устройство>" ;;
         *"политика ftp"*|*"scp/sftp"*|*"Not a directory"*|*"scp:"*)
             echo "у пользователя нет политики ftp — без неё scp/sftp не читают файлы: /user group set <группа> policy=...,ftp" ;;
-        *"нет SSH-доступа"*|*"Cannot connect"*|*"Connection refused"*|*"Connection timed out"*|*"No route to host"*|*"Permission denied (publickey"*|*"Host key verification failed"*)
+        *"Connection timed out"*|*"Operation timed out"*)
+            echo "роутер не отвечает по SSH: питание/канал/маршрут, либо сменился ssh-порт (harden меняет его) — сверьте порт в devices.conf; проверить: ssh -p <порт> backupUser@<ip>" ;;
+        *"Connection refused"*|*"Cannot connect"*)
+            echo "порт закрыт/не тот: сервис ssh выключен или порт в devices.conf не совпадает — сверьте /ip service print на роутере" ;;
+        *"нет SSH-доступа"*|*"No route to host"*|*"Permission denied (publickey"*|*"Host key verification failed"*)
             echo "проверьте сеть/порт и ключ: на роутере /user ssh-keys print, у пользователя политики ssh (и read/write)" ;;
         *"не создаётся"*|*"мало места"*|*"no space"*|*"not enough free"*|*"disk full"*|*"не появился"*)
             echo "мало места на flash: /system resource print → free-hdd-space, /file print; лишние файлы удаляются вручную" ;;

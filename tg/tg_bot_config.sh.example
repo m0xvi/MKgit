@@ -126,6 +126,9 @@ export DEPLOY_KEY_PRIV="/home/aionis/.ssh/mk_key"
 # TL_USER — АДМИНИСТРАТОР роутера (обычно admin): у пользователя бэкапа нет
 # прав на /user. DEPLOY_TL_PASS обязателен для выдачи прав; пароль передаётся
 # по SSH через SSH_ASKPASS (пакет expect НЕ нужен).
+# ВАЖНО: если группа пользователя содержит policy (например forbackup), права
+# выдаются БЕЗ администратора — ключом самого пользователя
+# (tg/fix_rights_self.sh). Тогда DEPLOY_TL_PASS можно оставить пустым.
 export DEPLOY_TL_USER="admin"
 export DEPLOY_TL_PORT="23"
 export DEPLOY_TL_PASS=""

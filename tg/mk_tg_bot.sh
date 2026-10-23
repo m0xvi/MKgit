@@ -692,6 +692,8 @@ log_sanitize() {
                 [ -n "$s" ] && line="${line//"$s"/[SCRUBBED]}"
             done <<< "$svals"
         fi
+        # ANSI-цвета из логов (иначе в Telegram видно «[1;33m»)
+        line="$(printf '%s' "$line" | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g; s/\x1b\[[0-9;]*[A-Za-z]//g')"
         # Сгенерированные пароли вида mk-<epoch>-<random>
         line="$(printf '%s' "$line" | sed -E 's/(password[[:space:]]*=[[:space:]]*)mk-[0-9]+-[0-9]+/\1[SCRUBBED]/Ig')"
         line="$(printf '%s' "$line" | sed -E 's/(password[[:space:]]*=[[:space:]]*\")[^\"]*(\")/\1[SCRUBBED]\2/Ig')"

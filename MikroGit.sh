@@ -72,6 +72,9 @@ ROUTER_CLEANUP_DAYS="${ROUTER_CLEANUP_DAYS:-30}"
 ROUTER_SAVE_TRIES="${ROUTER_SAVE_TRIES:-3}"
 # При агрессивной уборке оставлять на роутере самый свежий наш файл
 ROUTER_KEEP_NEWEST="${ROUTER_KEEP_NEWEST:-1}"
+# Сколько наших файлов оставлять НА РОУТЕРЕ, если скачать не удалось
+# (иначе каждый день на flash остаётся ещё один .backup, а там 1 МБ).
+ROUTER_KEEP_REMOTE="${ROUTER_KEEP_REMOTE:-1}"
 # Сколько секунд ждать появления файла после /system backup save
 ROUTER_FILE_WAIT="${ROUTER_FILE_WAIT:-10}"
 # Если .backup создан, но не скачивается из-за политик sensitive/ftp —
@@ -547,6 +550,40 @@ ros_cleanup_old_backups() {
     return 1
 }
 
+# Оставить на роутере только N самых свежих наших файлов ЭТОГО устройства.
+# Вызывается, когда .backup скачать не удалось: файл остаётся на роутере, но
+# копиться им там нельзя (на многих AP всего 1 МБ свободного flash).
+# $1 — имя устройства; $2 — сколько оставить (по умолчанию ROUTER_KEEP_REMOTE)
+ros_trim_remote_backups() {
+    local dev="$1" keep="${2:-${ROUTER_KEEP_REMOTE:-1}}"
+    local list name epoch n=0
+    local -a arr=()
+    [ -n "$dev" ] || return 1
+    list=$(ros_file_list_tsv) || return 1
+    [ -n "$list" ] || return 1
+    while IFS=$'\t' read -r name _size; do
+        [ -n "$name" ] || continue
+        case "$name" in
+            "${dev}"_*.backup|"pre_update_${dev}"_*.backup) ;;
+            *) continue ;;
+        esac
+        ros_is_our_backup_name "$name" || continue
+        epoch=$(ros_name_epoch "$name") || epoch=0
+        arr+=("$epoch|$name")
+    done <<< "$list"
+    [ ${#arr[@]} -gt "$keep" ] || return 0
+    # свежие первыми, лишние — в удаление
+    while IFS= read -r line; do
+        n=$((n + 1))
+        [ "$n" -le "$keep" ] && continue
+        name="${line#*|}"
+        if ros_remove_file "$name"; then
+            info "  удалён старый файл с роутера: $name"
+        fi
+    done < <(printf '%s\n' "${arr[@]}" | sort -t'|' -k1,1nr)
+    return 0
+}
+
 # Убедиться, что на flash достаточно места (при нехватке — чистим старое)
 # $1 — сколько байт нужно
 ros_ensure_space() {
@@ -570,6 +607,32 @@ ros_ensure_space() {
     return 0
 }
 
+# Выдать недостающие политики БЕЗ администратора: ключом самого пользователя.
+# Работает, когда группа пользователя уже содержит policy+write — RouterOS
+# разрешает такому пользователю править собственную группу. Группа не
+# меняется, добавляются только недостающие политики.
+# rc: 0 — права в порядке (или только что добавлены); 1 — так нельзя.
+router_self_grant_policies() {
+    [ "${ROUTER_SELF_GRANT:-1}" = "1" ] || return 1
+    [ -f "$SCRIPT_DIR/tg/fix_rights_self.sh" ] || return 1
+    local out rc=0 policy
+    policy="${DEPLOY_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}"
+    case ",$policy," in *,sensitive,*) ;; *) policy="$policy,sensitive" ;; esac
+    case ",$policy," in *,ftp,*) ;; *) policy="$policy,ftp" ;; esac
+
+    out=$(CONFIG_FILE="$CONFIG_FILE" SSH_KEY="$SSH_KEY" \
+          SSH_TIMEOUT="${SSH_TIMEOUT:-10}" TARGET_POLICY="$policy" \
+          bash "$SCRIPT_DIR/tg/fix_rights_self.sh" "$DEV_NAME" 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf '%s\n' "$out" | grep -q 'политики добавлены' && \
+            info "$DEV_NAME: политики добавлены ключом пользователя (без администратора)"
+        return 0
+    fi
+    log "$DEV_NAME: права ключом пользователя не выдались (rc=$rc): $(printf '%s' "$out" | grep -E '^\[ERR\]' | head -1)"
+    SELF_GRANT_WHY="$(printf '%s\n' "$out" | grep -E '^\[ERR\]' | head -1 | sed 's/^\[ERR\] //')"
+    return 1
+}
+
 # Выдать недостающие политики через существующий деплой (tg/deploy_key.sh).
 # Правит ТУ группу, в которой пользователь уже состоит; в mikrogit не переводит.
 # rc: 0 — политики в порядке (ничего не делали)
@@ -580,6 +643,7 @@ router_fix_policies() {
     [ -f "$SCRIPT_DIR/tg/deploy_key.sh" ] || return 1
 
     local flags missing="" cur_group="" fixtarget
+    SELF_GRANT_WHY=""
     flags=$(ros_user_policy_flags "$DEV_USER" 2>/dev/null)
     [ -n "$flags" ] || return 1
     cur_group="${flags%%|*}"
@@ -588,8 +652,15 @@ router_fix_policies() {
     case "$flags" in *"read=0"*)      missing="$missing read" ;; esac
     [ -n "$missing" ] || return 0       # всё на месте
 
+    # --- шаг 1: своим ключом, без администратора ---
+    if router_self_grant_policies; then
+        return 2
+    fi
+
+    # --- шаг 2: через деплой (нужен пароль администратора) ---
     if [ -z "${DEPLOY_TL_PASS:-}" ] && [ ! -f "$SCRIPT_DIR/tg/deploy.conf" ]; then
-        warning "$DEV_NAME: пароль администратора не задан (DEPLOY_TL_PASS в tg/tg_bot_config.sh или TL_PASS в tg/deploy.conf) — выдать права автоматически нельзя"
+        warning "$DEV_NAME: без администратора права выдать нельзя${SELF_GRANT_WHY:+ ($SELF_GRANT_WHY)}"
+        warning "$DEV_NAME: укажите пароль администратора: DEPLOY_TL_USER=admin и DEPLOY_TL_PASS в tg/tg_bot_config.sh (или TL_USER/TL_PASS в tg/deploy.conf)"
         return 1
     fi
     if [ -n "${DEPLOY_TL_USER:-}" ] && [ "${DEPLOY_TL_USER}" = "$DEV_USER" ]; then
@@ -801,15 +872,21 @@ backup_device() {
             fi
             if [ -n "$missing" ]; then
                 BACKUP_ERROR="файл ${base}.backup есть на роутере ($(human_bytes "$(ros_size_to_bytes "${rsize:-0}")")), но scp/sftp не может его забрать: у пользователя $DEV_USER нет политик:$missing${grp:+ (группа $grp)}"
+                case "${SELF_GRANT_WHY:-}" in
+                    *"not enough permissions"*|*"permission"*|*"denied"*)
+                        BACKUP_ERROR="$BACKUP_ERROR; в группе нет политик policy/write — сам себе выдать нельзя, нужен администратор" ;;
+                esac
                 error "$device_name: $BACKUP_ERROR"
-                warning "RouterOS не отдаёт .backup по scp/ftp без политики sensitive (и ftp). Winbox: System → Users → Groups → ${grp:-<группа>} → Policy → включите sensitive, ftp, read."
+                warning "RouterOS не отдаёт .backup по scp/ftp без политик sensitive и ftp (группа ${grp:-?})."
+                warning "Исправить автоматически: bash tg/fix_rights_self.sh $device_name  (ключом пользователя)"
+                warning "                     или: bash tg/mk_deploy.sh $device_name  (через администратора)"
                 local plist fixcmd
                 plist=$(ros_user_policy_list "$DEV_USER" 2>/dev/null || true)
                 if [ -n "$plist" ] && [ -n "$grp" ]; then
                     case ",$plist," in *,sensitive,*) ;; *) plist="$plist,sensitive" ;; esac
                     case ",$plist," in *,ftp,*) ;; *) plist="$plist,ftp" ;; esac
                     fixcmd="/user group set [find name=$grp] policy=$plist"
-                    warning "Исправить (на роутере, от admin): $fixcmd"
+                    warning "Крайний вариант (на роутере, от администратора): $fixcmd"
                     info "Пользователь $DEV_USER должен переподключиться (выход/вход по SSH) после смены политик."
                 fi
             else
@@ -818,6 +895,8 @@ backup_device() {
                 warning "Пробовали scp, scp -O и sftp. Проверьте политику ftp у $DEV_USER, службу ftp на роутере и SSH-порт."
             fi
             warning "Файл оставлен на роутере: ${base}.backup"
+            # flash на AP маленькая (1 МБ): не даём копиться нескачанным файлам
+            ros_trim_remote_backups "$device_name" 2>/dev/null || true
             return 1
         fi
         local free_now

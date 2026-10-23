@@ -433,6 +433,30 @@ rup_tsv_escape_detail() {
 # Печатает TSV-строку:
 #   name<TAB>status<TAB>major<TAB>installed<TAB>latest<TAB>channel<TAB>detail
 # где status: UPDATE | CURRENT | BUSY | ERROR
+# --- Права пользователя бэкапа: довести недостающие политики ----------------
+# Обновлениям нужны write/test/reboot/policy. Если группа пользователя не
+# содержит policy, права выдаёт администратор (DEPLOY_TL_PASS); если содержит —
+# их можно добавить ключом самого пользователя, без админа.
+# Тихо: пишет в лог только когда что-то реально изменилось/не получилось.
+rup_rights_preflight() {
+    local name="$1" rc=0 out
+    [ "${UPDATE_SELF_FIX:-1}" = "1" ] || return 0
+    local script="$RUP_SCRIPT_DIR/fix_rights_self.sh"
+    [ -f "$script" ] || return 0
+    out=$(CONFIG_FILE="$(rup_cfg_file)" \
+          SSH_KEY="${SSH_KEY:-$HOME/.ssh/mk_key}" \
+          SSH_TIMEOUT="${UPDATE_SSH_TIMEOUT:-60}" \
+          TARGET_POLICY="${UPDATE_TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}" \
+          bash "$script" "$name" 2>&1) || rc=$?
+    case "$rc" in
+        0) printf '%s\n' "$out" | grep -q 'политики добавлены' && \
+               rup_log "$name: политики добавлены ключом пользователя (без администратора)" ;;
+        3) rup_log "$name: у группы нет policy/write — права может изменить только администратор" ;;
+        *) rup_log "$name: проверить права не удалось (rc=$rc)" ;;
+    esac
+    return 0
+}
+
 rup_check_device() {
     local name="$1"
     local chan_cfg="$UPDATE_CHANNEL"
@@ -458,6 +482,10 @@ rup_check_device() {
     cur_ver=$(rup_ver_clean "$cur_ver")
     major=$(rup_version_major "$cur_ver")
 
+    # права: недостающие политики добавляем сразу (ключом пользователя, если
+    # может; иначе причина останется в логе)
+    rup_rights_preflight "$name"
+
     # --- канал (принудительно, если задан UPDATE_CHANNEL) ---
     if [ -n "$chan_cfg" ]; then
         rup_ssh_exec "$name" "/system package update set channel=$chan_cfg" "${UPDATE_SSH_TIMEOUT:-60}" > /dev/null 2>&1
@@ -468,7 +496,9 @@ rup_check_device() {
     # поэтому ограничиваем по времени, чтобы одно устройство не блокировало все.
     out=$(rup_ssh_exec "$name" $'/system package update check-for-updates\n/system package update print' "${UPDATE_CHECK_TIMEOUT:-150}")
     rc=$?
-    if [ $rc -ne 0 ]; then
+    if [ $rc -eq 0 ] && printf '%s' "$out" | grep -qiE 'not enough permissions|permission denied'; then
+        detail="роутер отказал по правам (not enough permissions) — группе пользователя нужны политики write,policy,test,reboot"
+    elif [ $rc -ne 0 ]; then
         if [ "$rc" -eq 124 ]; then
             detail="check-for-updates не ответил за ${UPDATE_CHECK_TIMEOUT:-150}с (нет доступа роутера к upgrade.mikrotik.com?)"
         else

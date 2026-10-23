@@ -75,6 +75,10 @@ TARGET_USER="${TARGET_USER:-}"       # кому назначить ключ (е�
 # переводить его). Если пользователя ещё нет — берётся TARGET_GROUP_FALLBACK.
 TARGET_GROUP="${TARGET_GROUP-@current}"
 TARGET_GROUP_FALLBACK="${TARGET_GROUP_FALLBACK:-mikrogit}"
+# Скрипт «выдать права ключом самого пользователя» (рядом с deploy_key.sh)
+SELF_FIX_SCRIPT="${SELF_FIX_SCRIPT:-$SCRIPT_DIR/fix_rights_self.sh}"
+SELF_GRANT="${SELF_GRANT:-1}"
+SELF_GRANT_WHY=""
 # Политики группы TARGET_GROUP. Если группы на роутере ещё нет — она создаётся
 # с этими политиками; если уже есть — в неё ДОБАВЛЯЮТСЯ недостающие требуемые
 # политики (лишние не снимаются).
@@ -777,13 +781,40 @@ while IFS=':' read -r name ip port user desc; do
     admin_port="$ssh_port"
     echo "      вход: ssh $TL_USER@$ip:$admin_port"
 
+    # --- сначала пробуем БЕЗ администратора: ключом самого пользователя -------
+    # Если группа пользователя содержит policy+write, RouterOS разрешает ему
+    # править собственную группу — тогда ни пароль, ни вход админа не нужны.
+    if [ "$rights_only" = "1" ] && [ -f "$SELF_FIX_SCRIPT" ] && [ "${SELF_GRANT:-1}" = "1" ]; then
+        sg=0; sgout=""
+        sgout=$(DEVICES_CONF="$DEVICES_CONF" SSH_KEY="$KEY_PRIV" \
+                SSH_TIMEOUT="${SSH_TIMEOUT:-10}" TARGET_POLICY="$(need_policies)" \
+                MK_SSH_BIN="${MK_SSH_BIN:-ssh}" \
+                bash "$SELF_FIX_SCRIPT" "$name" 2>&1) || sg=$?
+        case "$sg" in
+            0)
+                printf '%s\n' "$sgout" | sed 's/^/      /' | tee -a "$LOG" >/dev/null
+                echo "      [OK] права в порядке — выданы ключом пользователя (без администратора)"
+                OK=$((OK+1)); continue
+                ;;
+            3)
+                echo "      [INFO] сам себе пользователь права выдать не может (в группе нет policy/write)"
+                SELF_GRANT_WHY="в группе нет политик policy/write"
+                ;;
+            *)
+                echo "      [WARN] выдать права ключом пользователя не удалось (rc=$sg)"
+                ;;
+        esac
+    fi
+
     # Пароль админа нужен для ЛЮБЫХ изменений на роутере. Без него сразу
     # объясняем причину, а не сыпем «нет ответа роутера».
     if [ -z "${TL_PASS:-}" ]; then
         echo "[ERR] нужен вход администратора, а пароль не задан."
+        [ -n "${SELF_GRANT_WHY:-}" ] && echo "      причина: $SELF_GRANT_WHY — правку прав без админа роутер не разрешает."
         echo "      Задайте DEPLOY_TL_PASS в tg/tg_bot_config.sh или TL_PASS в tg/deploy.conf."
-        echo "      TL_USER должен быть администратором (обычно admin), а не '$local_target':"
-        echo "      у ограниченного пользователя нет прав на /user, он не может выдать себе политики."
+        if [ "$TL_USER" = "$local_target" ]; then
+            echo "      TL_USER совпадает с пользователем бэкапа ('$local_target') — нужен администратор (обычно admin)."
+        fi
         FAIL=$((FAIL+1)); continue
     fi
     if [ "$TL_USER" = "$local_target" ]; then
@@ -800,6 +831,9 @@ while IFS=':' read -r name ip port user desc; do
 
     if ! ensure_client_deps; then
         echo "[$name] пропуск: нет ssh или не задан TL_PASS (пароль администратора)"
+        if [ -n "${SELF_GRANT_WHY:-}" ]; then
+            echo "      причина: $SELF_GRANT_WHY — нужен администратор с политикой policy"
+        fi
         FAIL=$((FAIL+1))
         continue
     fi
