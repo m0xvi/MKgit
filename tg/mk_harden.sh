@@ -23,8 +23,9 @@
 # ПРЕДУСЛОВИЯ:
 #   * выполнен деплой ключа/прав (mk_deploy.sh): пользователь из 4-го поля
 #     devices.conf заходит по ssh ключом и имеет права
-#     ssh,read,write,test,reboot,policy,ftp — иначе /ip service менять не даст,
-#     а scp-загрузку .rsc RouterOS отвергнет (file-доступ даёт только policy ftp);
+#     ssh,read,write,test,reboot,policy,ftp,sensitive — иначе /ip service менять
+#     не даст, а scp-загрузку .rsc RouterOS отвергнет (file-доступ даёт только
+#     policy ftp; sensitive нужен для .backup и для чтения sensitive-значений);
 #   * адрес ЭТОГО сервера входит в allowFrom (по умолчанию 10.20.9.11,
 #     192.168.10.89) — иначе после прогона сервер потеряет ssh к роутеру
 #     (бэкапы/обновления/деплой встанут!). Обёртка это проверяет и отказывается

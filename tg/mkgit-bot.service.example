@@ -1,0 +1,43 @@
+# =============================================================================
+# systemd unit: Telegram-бот MikroGit
+# -----------------------------------------------------------------------------
+# Установка (путь/пользователя поправьте под себя):
+#   sudo cp tg/mkgit-bot.service.example /etc/systemd/system/mkgit-bot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mkgit-bot
+#   sudo systemctl status mkgit-bot
+#   journalctl -u mkgit-bot -f
+#
+# ВАЖНО:
+#   • User должен быть ВЛАДЕЛЬЦЕМ каталога репозитория (обычно aionis),
+#     иначе бот не сможет писать в logs/, bckp/ и снимать lock.
+#   • Перед первым запуском остановите все ручные копии бота:
+#         pkill -f mk_tg_bot.sh
+#     иначе сработает защита от второго экземпляра (lock).
+# =============================================================================
+
+[Unit]
+Description=MikroGit Telegram bot (MikroTik backups / RouterOS updates)
+After=network-online.target
+Wants=network-online.target
+# если бот/планировщик уже запущен вручную, systemd не должен
+# перезапускать сервис бесконечно — после 5 попыток за 5 минут он сдаётся
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=aionis
+Group=aionis
+WorkingDirectory=/home/aionis/MikroGit/tg
+ExecStart=/home/aionis/MikroGit/tg/start_bot_with_ssh.sh
+Restart=on-failure
+RestartSec=15
+# не даём OOM-киллеру убить бота раньше его ssh/бэкап-воркеров
+OOMScoreAdjust=-200
+# при остановке гасим всю группу (бот + его фоновые воркеры)
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

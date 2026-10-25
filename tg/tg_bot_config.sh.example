@@ -11,7 +11,24 @@ export TELEGRAM_CHAT_ID=""
 # --- Paths ---
 export CONFIG_FILE="/home/aionis/MikroGit/devices.conf"
 export BACKUP_SCRIPT="/home/aionis/MikroGit/MikroGit.sh"
+# Каталог бэкапов и логов. ВАЖНО: бот и MikroGit.sh должны смотреть в ОДИН
+# каталог, иначе бот «не видит» бэкапы. Если BACKUP_DIR не задан — берётся
+# <папка проекта>/bckp.
+export BACKUP_DIR="/home/aionis/MikroGit/bckp"
 export LOG_FILE="/home/aionis/MikroGit/logs/mk_backup.log"
+# Отчёты о бэкапах (раньше сыпались в корень bckp/)
+export REPORTS_DIR="/home/aionis/MikroGit/logs/reports"
+
+# --- Ротация (MikroGit.sh + автоочистка) ---
+# Сколько бэкапов хранить на устройство. Плановые и «перед обновлением»
+# считаются РАЗДЕЛЬНО (бэкап перед обновлением не вымывается плановыми).
+export MAX_BACKUPS_PER_DEVICE=5
+export MAX_PRE_UPDATE_BACKUPS=5
+export MAX_REPORTS=5
+# Через сколько дней удалять старые ~/deploy_key_*.log и сколько хранить архивов логов
+export MKC_HOME_LOG_DAYS=7
+export MKC_LOG_KEEP=3
+export MKC_LOG_MAX_BYTES=10485760
 
 # --- Proxy Settings (REQUIRED for Russia) ---
 # Supported types: http, socks5, socks5h
@@ -56,8 +73,13 @@ export SSH_KEY="$HOME/.ssh/mk_key"
 # устройстве). Для единообразия на всех устройствах обычно задают stable.
 export UPDATE_CHANNEL="stable"
 
-# Делать резервную копию конфигурации (MikroGit.sh --device) перед установкой
+# Делать резервную копию .backup перед установкой RouterOS (MikroGit.sh
+# --device <имя> --pre-update). Файл ложится в bckp/<устройство>/ с префиксом
+# pre_update_ и виден в боте: 📥 Download → 🛡 Перед обновлением.
 export UPDATE_BACKUP_BEFORE_APPLY="1"
+
+# Делать .backup и перед обновлением RouterBOOT firmware (по умолчанию да)
+export UPDATE_BACKUP_BEFORE_RB="1"
 
 # Таймаут скачивания обновления на роутере, сек
 export UPDATE_DOWNLOAD_TIMEOUT="900"
@@ -101,19 +123,29 @@ export DEPLOY_KEY_PRIV="/home/aionis/.ssh/mk_key"
 #   • DEPLOY_TL_PORT — это порт TELNET администратора (обычно 23);
 #   • SSH-порт для входа/проверок берётся ИЗ devices.conf (3-е поле) для
 #     каждого устройства отдельно — глобально его задавать не нужно.
+# TL_USER — АДМИНИСТРАТОР роутера (обычно admin): у пользователя бэкапа нет
+# прав на /user. DEPLOY_TL_PASS обязателен для выдачи прав; пароль передаётся
+# по SSH через SSH_ASKPASS (пакет expect НЕ нужен).
+# ВАЖНО: если группа пользователя содержит policy (например forbackup), права
+# выдаются БЕЗ администратора — ключом самого пользователя
+# (tg/fix_rights_self.sh). Тогда DEPLOY_TL_PASS можно оставить пустым.
 export DEPLOY_TL_USER="admin"
 export DEPLOY_TL_PORT="23"
 export DEPLOY_TL_PASS=""
 
-# Группа прав пользователя после деплоя. Вместо full — отдельная группа
-# «mikrogit» с МИНИМАЛЬНО необходимыми политиками (DEPLOY_TARGET_POLICY).
-# Если группы на роутере нет — deploy_key.sh создаст её сам. Политики
-# существующей группы не меняются. Пусто = НЕ менять права, только показать.
-export DEPLOY_TARGET_GROUP="mikrogit"
-# Политики группы DEPLOY_TARGET_GROUP (используются при её создании).
-# ssh,read,write,test,reboot,policy — минимум, при котором работают бэкапы и
-# установка обновлений RouterOS из самого роутера. Меняйте осознанно.
-export DEPLOY_TARGET_POLICY="ssh,read,write,test,reboot,policy"
+# Группа прав пользователя после деплоя.
+#   "@current" (по умолчанию) — править группу, в которой пользователь уже
+#                состоит (forbackup и т.п.): добавляются только недостающие
+#                политики, пользователь НЕ переводится;
+#   "mikrogit"   — отдельная группа (переведёт пользователя в неё);
+#   пусто        — не менять права, только показать.
+export DEPLOY_TARGET_GROUP="@current"
+# Политики группы DEPLOY_TARGET_GROUP. Минимум для работы бота:
+#   ssh,read,write,test,reboot,policy — бэкапы и обновления RouterOS;
+#   ftp      — scp/sftp (хардненинг, скачивание файлов);
+#   sensitive— ОБЯЗАТЕЛЬНО для .backup: без неё RouterOS не отдаёт файл
+#              по scp/ftp, и бэкап «создаётся, но не скачивается».
+export DEPLOY_TARGET_POLICY="ssh,read,write,test,reboot,policy,ftp,sensitive"
 # Целевой пользователь (пусто = пользователь из 4-го поля devices.conf)
 export DEPLOY_TARGET_USER=""
 # Пароль для СОЗДАВАЕМОГО пользователя (пусто = случайный, будет в логе)
@@ -126,3 +158,25 @@ export DEPLOY_SSH_PROBE="1"
 export DEPLOY_SSH_VERIFY="1"
 # Wall-clock лимит на одно устройство, сек
 export DEPLOY_ONE_TIMEOUT="600"
+
+# =============================================================================
+# Расписание бэкапов и обновлений (tg/mk_schedule.sh)
+# =============================================================================
+# Значения по умолчанию; меняются из бота: меню «🗓 Расписание» и хранятся в
+# logs/schedule/schedule.conf (их значения важнее этих).
+#   SCHED_ENABLED          — 1 = планировщик включён
+#   SCHED_BACKUP_ENABLED   — 1 = бэкап всех устройств ежедневно
+#   SCHED_BACKUP_HOUR/MINUTE — время ежедневного бэкапа (03:00)
+#   SCHED_UPDATE_ENABLED   — 1 = проверка/установка обновлений раз в неделю
+#   SCHED_UPDATE_WEEKDAY   — день недели (1=Пн … 7=Вс), по умолчанию 7 (Вс)
+#   SCHED_UPDATE_HOUR/MINUTE — время обновлений (04:00)
+#   SCHED_UPDATE_MODE      — check (только проверка + отчёт) | apply (автоустановка)
+export SCHED_ENABLED=1
+export SCHED_BACKUP_ENABLED=1
+export SCHED_BACKUP_HOUR=3
+export SCHED_BACKUP_MINUTE=0
+export SCHED_UPDATE_ENABLED=1
+export SCHED_UPDATE_WEEKDAY=7
+export SCHED_UPDATE_HOUR=4
+export SCHED_UPDATE_MINUTE=0
+export SCHED_UPDATE_MODE="check"

@@ -14,8 +14,10 @@
 # ПРАВА: вместо встроенной группы full (все политики) деплой приводит целевого
 # пользователя к отдельной группе TARGET_GROUP (по умолчанию «mikrogit») с
 # МИНИМАЛЬНЫМ набором политик TARGET_POLICY (по умолчанию
-# ssh,read,write,test,reboot,policy,ftp). ftp даёт file-доступ по scp/sftp —
-# без него хардненинг (mk_harden.sh) не сможет залить скрипт на роутер.
+# ssh,read,write,test,reboot,policy,ftp,sensitive). ftp даёт file-доступ по
+# scp/sftp — без него хардненинг (mk_harden.sh) не сможет залить скрипт на
+# роутер, а без sensitive RouterOS не отдаёт по scp/ftp файлы .backup (внутри
+# пароли) — именно из-за этого бэкап «создаётся», но не скачивается.
 # Если группа отсутствует на роутере — она создаётся с этими политиками;
 # существующая группа не переопределяется «вслепую»: добавляются только
 # недостающие требуемые политики (при невозможности прочитать политики группы
@@ -26,8 +28,8 @@
 # (приоритет у окружения: строки deploy.conf применяются, только если
 # соответствующая переменная окружения пуста).
 #
-# Зависимости: expect + openssh-client
-# (sudo apt-get install -y expect openssh-client)
+# Зависимости: openssh-client (ssh) + setsid (util-linux, почти всегда есть).
+# expect НЕ нужен: пароль администратора передаётся через SSH_ASKPASS.
 # =============================================================================
 set -uo pipefail
 
@@ -69,14 +71,25 @@ TARGET_USER="${TARGET_USER:-}"       # кому назначить ключ (е�
 # Группа, в которую должен входить целевой пользователь (вместо «full»).
 # По умолчанию — отдельная группа mikrogit с МИНИМАЛЬНЫМ набором политик
 # (TARGET_POLICY). Если задать пустым — права НЕ трогаются (только проверка).
-TARGET_GROUP="${TARGET_GROUP-mikrogit}"
+# "@current" = править ту группу, в которой пользователь уже состоит (не
+# переводить его). Если пользователя ещё нет — берётся TARGET_GROUP_FALLBACK.
+TARGET_GROUP="${TARGET_GROUP-@current}"
+TARGET_GROUP_FALLBACK="${TARGET_GROUP_FALLBACK:-mikrogit}"
+# Скрипт «выдать права ключом самого пользователя» (рядом с deploy_key.sh)
+SELF_FIX_SCRIPT="${SELF_FIX_SCRIPT:-$SCRIPT_DIR/fix_rights_self.sh}"
+SELF_GRANT="${SELF_GRANT:-1}"
+# Что добавляем без администратора (reboot не трогаем — он не нужен для бэкапа)
+SELF_GRANT_POLICY="${SELF_GRANT_POLICY:-ssh,read,write,test,policy,ftp,sensitive}"
+SELF_GRANT_WHY=""
 # Политики группы TARGET_GROUP. Если группы на роутере ещё нет — она создаётся
 # с этими политиками; если уже есть — в неё ДОБАВЛЯЮТСЯ недостающие требуемые
 # политики (лишние не снимаются).
 # Минимальный набор, достаточный для задач бота (бэкапы + проверка/установка
 # обновлений RouterOS через сам роутер + RouterBOOT + заливка скрипта
-# хардненинга по scp): ssh,read,write,test,reboot,policy,ftp.
-TARGET_POLICY="${TARGET_POLICY-ssh,read,write,test,reboot,policy,ftp}"
+# хардненинга по scp + скачивание .backup): ssh,read,write,test,reboot,policy,
+# ftp,sensitive. sensitive обязателен: .backup помечен как sensitive, и без
+# этой политики RouterOS не отдаёт его по scp/sftp/ftp.
+TARGET_POLICY="${TARGET_POLICY-ssh,read,write,test,reboot,policy,ftp,sensitive}"
 NEWUSER_PASS="${NEWUSER_PASS:-}"     # пароль для СОЗДАВАЕМОГО пользователя (если TARGET_USER не существует)
 SSH_PROBE="${SSH_PROBE:-1}"          # проверять ли вход целевым SSH-ключом (1/0); 0 = всегда полный прогон
 SSH_TIMEOUT="${SSH_TIMEOUT:-8}"      # таймаут SSH-проверки на устройство, сек
@@ -130,22 +143,19 @@ if [ ! -f "$KEY_PRIV" ]; then
         SSH_PROBE=0
     fi
 fi
-# expect/ssh/TL_PASS проверяем ЛЕНИВО — только когда реально понадобится
-# SSH-вход администратора (если все устройства уже настроены — они не нужны).
+# ssh/TL_PASS проверяем ЛЕНИВО — только когда реально понадобится SSH-вход
+# администратора (если все устройства уже настроены — они не нужны).
 _CLI_OK=         # 1 = deps проверены и есть
 _CLI_ERR=        # 1 = ошибка уже напечатана (не дублировать на каждый роутер)
 ensure_client_deps() {
     # Перед реальным заходом администратора по SSH.
     if [ -n "$_CLI_ERR" ]; then return 1; fi
     if [ -z "$_CLI_OK" ]; then
-        if ! command -v expect >/dev/null 2>&1; then
-            _CLI_ERR=1; echo "ERROR: установите expect (apt-get install -y expect)" >&2; return 1
-        fi
         if ! command -v ssh >/dev/null 2>&1; then
             _CLI_ERR=1; echo "ERROR: установите openssh-client (ssh)" >&2; return 1
         fi
         if [ -z "$TL_PASS" ]; then
-            _CLI_ERR=1; echo "ERROR: задайте TL_PASS (пароль администратора $TL_USER)" >&2; return 1
+            _CLI_ERR=1; echo "ERROR: задайте TL_PASS (пароль администратора $TL_USER) — DEPLOY_TL_PASS в tg_bot_config.sh или TL_PASS в tg/deploy.conf" >&2; return 1
         fi
         _CLI_OK=1
     fi
@@ -203,7 +213,11 @@ scrub_secrets() {
 }
 
 KEY_TEXT=$(tr -d '\r\n' < "$KEY_FILE")
-LOG="deploy_key_$(date +%Y%m%d_%H%M%S).log"
+# Лог — в logs/deploy/, а не в текущем каталоге запуска: раньше запуск из ~
+# оставлял там deploy_key_YYYYMMDD_*.log на каждый прогон (мусор в ~).
+DEPLOY_LOG_DIR="${DEPLOY_LOG_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)/logs/deploy}"
+mkdir -p "$DEPLOY_LOG_DIR" 2>/dev/null || DEPLOY_LOG_DIR="$SCRIPT_DIR"
+LOG="$DEPLOY_LOG_DIR/deploy_key_$(date +%Y%m%d_%H%M%S).log"
 
 echo "devices.conf : $DEVICES_CONF"
 echo "ключ         : $KEY_FILE"
@@ -211,8 +225,12 @@ echo "SSH-проверка : $([ "$SSH_PROBE" = "1" ] && echo "вкл (${KEY_PRI
 echo "вход админа  : ssh $TL_USER@<ip> — порт каждого устройства из devices.conf, поле 3 (telnet удалён)"; [ -n "$TL_PASS" ] || echo "WARN: TL_PASS не задан — вход администратора невозможен"
 [ "$SSH_VERIFY" = "1" ] && [ "$SSH_PROBE" = "1" ] && echo "подтверждение: после развёртывания вход ключом проверяется повторно (SSH)"
 echo "целевой user : ${TARGET_USER:-<из devices.conf, поле 4>}"
-echo "права (группа): ${TARGET_GROUP:-<не менять, только проверка>}"
-[ -n "$TARGET_GROUP" ] && echo "  политики группы : ${TARGET_POLICY:-<как на роутере>} (если группы нет — создаётся с ними)"
+case "${TARGET_GROUP:-}" in
+    "@current") echo "права (группа): текущая группа пользователя (пользователь не переводится)" ;;
+    "")         echo "права (группа): <не менять, только проверка>" ;;
+    *)          echo "права (группа): $TARGET_GROUP" ;;
+esac
+[ -n "$TARGET_GROUP" ] && echo "  политики группы : ${TARGET_POLICY:-<как на роутере>} (недостающие добавляются)"
 [ "$DRY_RUN" = "1" ] && echo "РЕЖИМ: dry-run (без подключения)"
 [ "$CHECK_ONLY" = "1" ] && echo "РЕЖИМ: только проверка (--check): у кого ключ уже работает"
 [ "$FORCE" = "1" ] && echo "РЕЖИМ: --force (без SSH-предпроверки, разворачивать на всех)"
@@ -279,7 +297,10 @@ ssh_group_policy_of_user() {
         -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout="$SSH_TIMEOUT" -o LogLevel=ERROR \
         "$target@$host" ":put [/user group get [find name=$g] policy]" 2>/dev/null < /dev/null)
-    pol=$(printf '%s' "$out" | tr -d '\r' | grep -E '^"?[a-zA-Z][a-zA-Z0-9,; _-]*"?$' | tail -n1 | tr -d '"' | tr ';' ',' | tr -d ' ')
+    # RouterOS печатает список с переносами/отступами и "!" перед запретами
+    pol=$(printf '%s' "$out" | tr -d ' \t\r\n' | tr ';' ',' | tr -d '"')
+    # отбрасываем мусор (если пришло что-то кроме списка политик)
+    case "$pol" in *[!A-Za-z0-9!,_-]*) pol="" ;; esac
     if [ -n "$pol" ]; then
         printf '%s\n' "$pol"
         return 0
@@ -289,7 +310,7 @@ ssh_group_policy_of_user() {
 
 
 # Список требуемых политик (для точной проверки прав пользователя)
-need_policies() { echo "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp}"; }
+need_policies() { echo "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}"; }
 
 # Покрывает ли список политик $1 (через запятую) все требуемые из $2.
 pol_has_all() {
@@ -320,52 +341,69 @@ pol_has_all() {
 # Пароль уходит только в stdin ssh (в лог/эхо не попадает).
 # Результат: stdout роутера -> $ADM_OUT, статус -> $ADM_RC
 # (0 = выполнено, 2 = недоступно/соединение, 3 = timeout, 4 = нет TL_PASS,
-#  5 = неверный пароль/доступ).
+#  5 = неверный пароль/доступ). expect не требуется: пароль отдаёт askpass.
 # ---------------------------------------------------------------------------
 adm_exec() {
-    local host="$1" sport="$2" cmd="$3" out xrc
+    local host="$1" sport="$2" cmd="$3" out rc ask
     ADM_OUT=""; ADM_RC=0
-    if [ "${ADM_FAKE:-0}" = "1" ]; then          # локальный стенд (тесты, без сети)
-        ADM_OUT="$(fake_router "$cmd")"
-        ADM_RC=0
-        return 0
-    fi
     [ -n "$TL_PASS" ] || { ADM_RC=4; return 1; }
-    out="$(ADM_HOST="$host" ADM_SPORT="$sport" ADM_LOGIN="$TL_USER" ADM_PASS="$TL_PASS" \
-        ADM_CMD="$cmd" expect <<'EXP' 2>&1
-set timeout 35
-log_user 0
-match_max 300000
-spawn ssh -T -p $env(ADM_SPORT) -o PreferredAuthentications=password \
-    -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
-    -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR $env(ADM_LOGIN)@$env(ADM_HOST) $env(ADM_CMD)
-set gotpw 0
-expect {
-    -re {[Pp]assword:} { send -- "$env(ADM_PASS)\r"; set gotpw 1 }
-    -re {[Pp]ermission denied} { exit 5 }
-    eof     { exit 2 }
-    timeout { exit 3 }
-}
-if {!$gotpw} { exit 2 }
-expect {
-    eof     { puts -nonewline $expect_out(buffer); exit 0 }
-    timeout { puts -nonewline $expect_out(buffer); exit 3 }
-}
-EXP
-)"
-    xrc=$?
-    ADM_OUT="$out"
-    case "$out" in
-        *"Permission denied"*)                                     ADM_RC=5 ;;
-        *"Connection refused"*|*"timed out"*|*"No route to host"*) ADM_RC=2 ;;
-        *)                                                         ADM_RC=$xrc ;;
+
+    # Пароль передаём через SSH_ASKPASS — expect НЕ нужен. Если expect не
+    # установлен, старая версия падала с «нет ответа роутера», хотя на самом
+    # деле ssh вообще не запускался. setsid убирает управляющий терминал,
+    # чтобы ssh гарантированно спросил пароль у askpass-скрипта.
+    ask="$(mktemp "${TMPDIR:-/tmp}/mkask.XXXXXX" 2>/dev/null)" || { ADM_RC=4; return 1; }
+    printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$MK_ASKPASS_PASS"' > "$ask"
+    chmod 700 "$ask" 2>/dev/null || true
+
+    # setsid (если есть) гарантирует отсутствие управляющего терминала,
+    # SSH_ASKPASS_REQUIRE=force — что ssh возьмёт пароль именно у askpass.
+    local runner=""
+    command -v setsid > /dev/null 2>&1 && runner="setsid -w"
+
+    out="$(MK_ASKPASS_PASS="$TL_PASS" SSH_ASKPASS="$ask" SSH_ASKPASS_REQUIRE=force \
+        DISPLAY=mkgit:0 $runner timeout -k 5 "${ADM_TIMEOUT:-45}" \
+        ssh -T -p "$sport" \
+            -o PreferredAuthentications=password,keyboard-interactive \
+            -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 \
+            -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            "$TL_USER@$host" "$cmd" 2>&1)"
+    rc=$?
+    rm -f "$ask" 2>/dev/null || true
+    ADM_OUT="$(printf '%s' "$out" | tr -d '\r')"
+
+    case "$rc" in
+        0) ADM_RC=0 ;;
+        124|125|137) ADM_RC=3 ;;
+        *)
+            case "$out" in
+                *"Permission denied"*|*"incorrect password"*|*"Authentication failed"*) ADM_RC=5 ;;
+                *"Connection refused"*|*"onnection timed out"*|*"No route to host"*|*"Could not resolve"*) ADM_RC=2 ;;
+                *) ADM_RC=$rc ;;
+            esac
+            ;;
     esac
     return "$ADM_RC"
 }
 
 # Последняя строка-значение из вывода :put (мусор баннера не проходит).
 put_val() { printf '%s\n' "$1" | tr -d '\r' | grep -E '^[A-Za-z0-9*][A-Za-z0-9*.,;:_+-]*$' | tail -n1; }
+
+# Понятное объяснение причины сбоя админ-сессии (ADM_RC).
+adm_fail_hint() {
+    local tgt="${1:-}"
+    case "${ADM_RC:-0}" in
+        4) echo "[ERR] не задан пароль администратора: TL_PASS / DEPLOY_TL_PASS — вход под '$TL_USER' невозможен" ;;
+        5) echo "[ERR] неверный пароль или запрещён вход по паролю для '$TL_USER'" ;;
+        2) echo "[ERR] нет SSH-соединения с роутером под '$TL_USER' (сеть/порт/сервис ssh)" ;;
+        3) echo "[ERR] таймаут SSH под '$TL_USER'" ;;
+        *) echo "[ERR] роутер не ответил на команду (rc=${ADM_RC:-?}) под '$TL_USER'" ;;
+    esac
+    if [ -n "${TL_USER:-}" ] && [ -n "$tgt" ] && [ "${TL_USER}" = "$tgt" ]; then
+        echo "      TL_USER совпадает с целевым пользователем — чтобы менять права, нужен администратор с политикой policy (обычно admin)"
+    fi
+}
 
 # Есть ли в выводе ошибка RouterOS (используется для записывающих команд).
 out_err() {
@@ -377,7 +415,7 @@ deploy_one() {
     # $1 host  $2 ssh-порт  $3 target  $4 rights_only  $5 npass (для нового user)
     local host="$1" sport="$2" target="$3" ro="$4" npass="$5"
     local req_pol tgroup
-    req_pol="$(printf '%s' "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp}" | tr -d ' \t' | tr ';' ',')"
+    req_pol="$(printf '%s' "${TARGET_POLICY:-ssh,read,write,test,reboot,policy,ftp,sensitive}" | tr -d ' \t' | tr ';' ',')"
     tgroup="${TARGET_GROUP:-}"
 
     # ssh-exec одной строкой (без pty); вывод в ADM_OUT/ADM_RC
@@ -396,7 +434,8 @@ deploy_one() {
         local g="$1"
         adm ":put [/user group find name=$g]"
         if [ "$ADM_RC" != "0" ]; then
-            echo "[ERR] нет ответа роутера при проверке группы '$g'"
+            echo "[ERR] не удалось проверить группу '$g'"
+            adm_fail_hint "$target"
             return 1
         fi
         if [ -n "$(put_val "$ADM_OUT")" ]; then
@@ -420,7 +459,11 @@ deploy_one() {
         [ -z "$g" ] && return 1
         adm ":put [/user group get [find name=$g] policy]"
         if [ "$ADM_RC" = "0" ]; then
-            p="$(printf '%s\n' "$ADM_OUT" | tr -d '\r' | grep -E '^"?[A-Za-z][A-Za-z0-9,; _-]*"?$' | tail -n1 | tr -d '"')"
+            p="$(printf '%s' "$ADM_OUT" | tr -d ' \t\r\n' | tr ';' ',' | tr -d '"')"
+            # если в выводе есть мусор — берём только допустимые символы
+            case "$p" in
+                *[!A-Za-z0-9!,_-]*) p="" ;;
+            esac
         fi
         if [ -z "$p" ]; then
             adm "/user group print detail where name=$g"
@@ -519,8 +562,20 @@ deploy_one() {
         # текущая группа пользователя
         cur=""
         adm ":put [/user get [find name=$target] group]"
-        if [ "$ADM_RC" = "0" ]; then cur="$(put_val "$ADM_OUT")"; fi
+        if [ "$ADM_RC" = "0" ]; then cur="$(put_val "$ADM_OUT")"; else adm_fail_hint "$target"; fi
         echo "[INFO] текущая группа пользователя '$target': ${cur:-не определена}"
+
+        # Режим @current: не переводим пользователя, а доводим его группу.
+        if [ "$tgroup" = "@current" ]; then
+            if [ -n "$cur" ]; then
+                tgroup="$cur"
+                echo "[INFO] режим @current: правлю существующую группу '$tgroup' (пользователь остаётся в ней)"
+            else
+                echo "[WARN] режим @current: группу пользователя '$target' прочитать не удалось — группу не меняю"
+                echo "[WARN] укажите TARGET_GROUP=<имя группы> (или проверьте доступ администратора)"
+                return 1
+            fi
+        fi
 
         # политики текущей группы
         pol_cur=""
@@ -622,10 +677,8 @@ deploy_one() {
         if [ "$has_user" = "0" ]; then
             echo "[INFO] пользователь '$target' на роутере не найден — создаю"
             local ugroup="$tgroup"
-            [ -n "$ugroup" ] || ugroup="full"
-            if [ -n "$tgroup" ]; then
-                ensure_group_here "$tgroup" || return 1
-            fi
+            case "$ugroup" in ""|@current) ugroup="${TARGET_GROUP_FALLBACK:-mikrogit}" ;; esac
+            [ "$ugroup" = "full" ] || ensure_group_here "$ugroup" || return 1
             adm "/user add name=$target group=$ugroup password=\"$npass\""
             if [ "$ADM_RC" != "0" ] || out_err "$ADM_OUT"; then
                 echo "[ERR] не удалось создать пользователя $target: $(printf '%s' "$ADM_OUT" | head -c 300)"
@@ -737,6 +790,47 @@ while IFS=':' read -r name ip port user desc; do
     admin_port="$ssh_port"
     echo "      вход: ssh $TL_USER@$ip:$admin_port"
 
+    # --- сначала пробуем БЕЗ администратора: ключом самого пользователя -------
+    # Если группа пользователя содержит policy+write, RouterOS разрешает ему
+    # править собственную группу — тогда ни пароль, ни вход админа не нужны.
+    if [ "$rights_only" = "1" ] && [ -f "$SELF_FIX_SCRIPT" ] && [ "${SELF_GRANT:-1}" = "1" ]; then
+        sg=0; sgout=""
+        sgout=$(DEVICES_CONF="$DEVICES_CONF" SSH_KEY="$KEY_PRIV" \
+                SSH_TIMEOUT="${SSH_TIMEOUT:-10}" TARGET_POLICY="$SELF_GRANT_POLICY" \
+                MK_SSH_BIN="${MK_SSH_BIN:-ssh}" \
+                bash "$SELF_FIX_SCRIPT" "$name" 2>&1) || sg=$?
+        case "$sg" in
+            0)
+                printf '%s\n' "$sgout" | sed 's/^/      /' | tee -a "$LOG" >/dev/null
+                echo "      [OK] права в порядке — выданы ключом пользователя (без администратора)"
+                OK=$((OK+1)); continue
+                ;;
+            3)
+                echo "      [INFO] сам себе пользователь права выдать не может (в группе нет policy/write)"
+                SELF_GRANT_WHY="в группе нет политик policy/write"
+                ;;
+            *)
+                echo "      [WARN] выдать права ключом пользователя не удалось (rc=$sg)"
+                ;;
+        esac
+    fi
+
+    # Пароль админа нужен для ЛЮБЫХ изменений на роутере. Без него сразу
+    # объясняем причину, а не сыпем «нет ответа роутера».
+    if [ -z "${TL_PASS:-}" ]; then
+        echo "[ERR] нужен вход администратора, а пароль не задан."
+        [ -n "${SELF_GRANT_WHY:-}" ] && echo "      причина: $SELF_GRANT_WHY — правку прав без админа роутер не разрешает."
+        echo "      Задайте DEPLOY_TL_PASS в tg/tg_bot_config.sh или TL_PASS в tg/deploy.conf."
+        if [ "$TL_USER" = "$local_target" ]; then
+            echo "      TL_USER совпадает с пользователем бэкапа ('$local_target') — нужен администратор (обычно admin)."
+        fi
+        FAIL=$((FAIL+1)); continue
+    fi
+    if [ "$TL_USER" = "$local_target" ]; then
+        echo "      [WARN] TL_USER совпадает с целевым пользователем ($local_target) —"
+        echo "             смена прав может не сработать: нужен администратор с политикой policy (обычно admin)."
+    fi
+
     # --- dry-run: показать план и остановиться ---
     if [ "$DRY_RUN" = "1" ]; then
         echo "[dry]     $ip — был бы вход по ssh ($TL_USER@$ip:$admin_port), ключ → $local_target"
@@ -745,7 +839,10 @@ while IFS=':' read -r name ip port user desc; do
     fi
 
     if ! ensure_client_deps; then
-        echo "[$name] пропуск: нет expect/ssh или TL_PASS"
+        echo "[$name] пропуск: нет ssh или не задан TL_PASS (пароль администратора)"
+        if [ -n "${SELF_GRANT_WHY:-}" ]; then
+            echo "      причина: $SELF_GRANT_WHY — нужен администратор с политикой policy"
+        fi
         FAIL=$((FAIL+1))
         continue
     fi
@@ -772,7 +869,7 @@ while IFS=':' read -r name ip port user desc; do
             fi
         elif [ "$SSH_VERIFY" = "1" ] && [ "$SSH_PROBE" = "1" ]; then
             # главный критерий успеха установки: ключ РЕАЛЬНО заходит по SSH.
-            # (вывод expect-сессии может скрывать ошибки — доверяем только проверке входа)
+            # (проверяем по реальному входу, а не по выводу админ-сессии)
             if ssh_key_works "$ip" "$ssh_port" "$local_target"; then
                 echo "      [OK] подтверждено: ssh $local_target@$ip — ключ работает"
                 OK=$((OK+1))

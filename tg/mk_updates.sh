@@ -80,6 +80,13 @@ rup_state_dir() {
 UPDATE_AUTO_CHECK="${UPDATE_AUTO_CHECK:-0}"
 UPDATE_AUTO_INTERVAL_HOURS="${UPDATE_AUTO_INTERVAL_HOURS:-24}"
 
+# Каталог бэкапов (тот же, что у MikroGit.sh): нужен, чтобы показать в
+# Telegram точное место, куда сохранён бэкап перед обновлением, и найти его.
+BACKUP_DIR="${BACKUP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bckp}"
+
+# Делать бэкап перед обновлением RouterBOOT firmware (1 = да)
+UPDATE_BACKUP_BEFORE_RB="${UPDATE_BACKUP_BEFORE_RB:-1}"
+
 # SSH опции (по образцу остальных скриптов репозитория)
 RUP_SSH_OPTS="${RUP_SSH_OPTS:--o PubkeyAcceptedAlgorithms=+ssh-rsa -o ConnectTimeout=15 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=20 -o ServerAliveCountMax=20}"
 RUP_SSH_BIN="${RUP_SSH_BIN:-ssh}"
@@ -89,16 +96,67 @@ RUP_SSH_BIN="${RUP_SSH_BIN:-ssh}"
 # -----------------------------------------------------------------------------
 RUP_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Общая библиотека работы с файлами бэкапов (список/пометки pre_update)
+if [ -f "$RUP_SCRIPT_DIR/mk_backup_lib.sh" ]; then
+    # shellcheck source=mk_backup_lib.sh
+    source "$RUP_SCRIPT_DIR/mk_backup_lib.sh"
+fi
+
 rup_log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE: $*" | tee -a "${LOG_FILE:-/tmp/mk_updates.log}"; }
 rup_err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] UPDATE ERROR: $*" | tee -a "${LOG_FILE:-/tmp/mk_updates.log}" >&2; }
 
+# Последние ошибки по устройствам: устройство<TAB>сообщение
+# (чтобы итоговая сводка «обновление всех» объясняла причины, а не только считала)
+rup_err_file() { echo "$(rup_state_dir)/last_errors.tsv"; }
+rup_errors_reset() {
+    mkdir -p "$(rup_state_dir)" 2>/dev/null || true
+    : > "$(rup_err_file)" 2>/dev/null || true
+}
+rup_note_error() {
+    local dev="${1:-}" msg="${2:-}"
+    [ -n "$dev" ] && [ -n "$msg" ] || return 0
+    mkdir -p "$(rup_state_dir)" 2>/dev/null || true
+    printf '%s\t%s\n' "$dev" "$(printf '%s' "$msg" | tr '\t\n\r' '   ')" >> "$(rup_err_file)" 2>/dev/null || true
+}
+# Устройство, к которому относится текущее сообщение (заполняют воркеры)
+RUP_CUR_DEV=""
+
 rup_send() {
     # Отправка сообщения в чат (TG-хелперы должны быть загружены; иначе no-op)
+    case "${1:-}" in
+        ❌*|⚠️*|🛑*) [ -n "${RUP_CUR_DEV:-}" ] && rup_note_error "$RUP_CUR_DEV" "$1" ;;
+    esac
     if declare -f tg_send_message > /dev/null 2>&1; then
         tg_send_message "${TELEGRAM_CHAT_ID:-}" "$1"
     else
         rup_log "(tg_send_message недоступен) $1"
     fi
+}
+
+# HTML-блок «Почему не вышло» для итоговой сводки (пусто, если ошибок нет)
+rup_errors_block() {
+    local max="${1:-6}" out="" dev msg hint n=0
+    local f; f=$(rup_err_file)
+    [ -s "$f" ] || return 0
+    while IFS=$'\t' read -r dev msg; do
+        [ -n "$dev" ] || continue
+        n=$((n+1))
+        [ "$n" -gt "$max" ] && { out+="<i>…и ещё</i>"$'\n'; break; }
+        hint=""
+        if declare -f bkl_reason_hint > /dev/null 2>&1; then
+            hint=$(bkl_reason_hint "$msg")
+        fi
+        # убираем эмодзи-статус и повтор «устройство:» — имя уже выводим сами
+        msg="${msg#❌ }"; msg="${msg#⚠️ }"; msg="${msg#🛑 }"; msg="${msg#⏳ }"; msg="${msg#🚫 }"
+        msg=$(printf '%s' "$msg" | sed -E 's/^\[[0-9]+\/[0-9]+\] //')
+        msg="${msg#<b>$dev</b>: }"
+        msg=$(printf '%s' "$msg" | sed -e 's/<[^>]*>//g' | cut -c1-200 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+        out+="• <b>$dev</b>: $msg"$'\n'
+        [ -n "$hint" ] && out+="  💡 $hint"$'\n'
+    done < <(awk -F'\t' '
+        { if (!($1 in seen)) { n++; order[n]=$1 } seen[$1]=1; msg[$1]=$2 }
+        END { for (i = 1; i <= n; i++) print order[i] "\t" msg[order[i]] }' "$f")
+    [ -n "$out" ] && printf '%s' "$out"
 }
 
 rup_send_keyboard() {
@@ -375,6 +433,52 @@ rup_tsv_escape_detail() {
 # Печатает TSV-строку:
 #   name<TAB>status<TAB>major<TAB>installed<TAB>latest<TAB>channel<TAB>detail
 # где status: UPDATE | CURRENT | BUSY | ERROR
+# Есть ли у пользователя право /system reboot. Без него обновление RouterOS
+# не завершится: пакет скачается, но роутер сам не перезагрузится.
+# rc: 0 — reboot разрешён; 1 — запрещён/неизвестно (текст причины в $RUP_REBOOT_WHY)
+RUP_REBOOT_WHY=""
+rup_has_reboot_policy() {
+    local name="$1" line user out pol
+    RUP_REBOOT_WHY=""
+    line=$(rup_get_line "$name") || return 1
+    IFS=':' read -r _ _ _ user _ <<< "$line"
+    out=$(rup_ssh_exec "$name" ":local u [/user find where name=\"$user\"]; :local g [/user get \$u group]; :put [/user group get [find name=\$g] policy]" "${UPDATE_SSH_TIMEOUT:-60}") || {
+        RUP_REBOOT_WHY="не удалось прочитать политики"
+        return 1
+    }
+    # RouterOS 6: список через ";" и с переносами, запреты — "!reboot"
+    pol=$(printf '%s' "$out" | tr -d ' \t\r\n' | tr ';' ',')
+    case ",$pol," in
+        *",reboot,"*) return 0 ;;
+    esac
+    RUP_REBOOT_WHY="в группе пользователя нет политики reboot"
+    return 1
+}
+
+# --- Права пользователя бэкапа: довести недостающие политики ----------------
+# Обновлениям нужны write/test/reboot/policy. Если группа пользователя не
+# содержит policy, права выдаёт администратор (DEPLOY_TL_PASS); если содержит —
+# их можно добавить ключом самого пользователя, без админа.
+# Тихо: пишет в лог только когда что-то реально изменилось/не получилось.
+rup_rights_preflight() {
+    local name="$1" rc=0 out
+    [ "${UPDATE_SELF_FIX:-1}" = "1" ] || return 0
+    local script="$RUP_SCRIPT_DIR/fix_rights_self.sh"
+    [ -f "$script" ] || return 0
+    out=$(CONFIG_FILE="$(rup_cfg_file)" \
+          SSH_KEY="${SSH_KEY:-$HOME/.ssh/mk_key}" \
+          SSH_TIMEOUT="${UPDATE_SSH_TIMEOUT:-60}" \
+          TARGET_POLICY="${UPDATE_TARGET_POLICY:-ssh,read,write,test,policy,ftp,sensitive}" \
+          bash "$script" "$name" 2>&1) || rc=$?
+    case "$rc" in
+        0) printf '%s\n' "$out" | grep -q 'политики добавлены' && \
+               rup_log "$name: политики добавлены ключом пользователя (без администратора)" ;;
+        3) rup_log "$name: у группы нет policy/write — права может изменить только администратор" ;;
+        *) rup_log "$name: проверить права не удалось (rc=$rc)" ;;
+    esac
+    return 0
+}
+
 rup_check_device() {
     local name="$1"
     local chan_cfg="$UPDATE_CHANNEL"
@@ -400,6 +504,10 @@ rup_check_device() {
     cur_ver=$(rup_ver_clean "$cur_ver")
     major=$(rup_version_major "$cur_ver")
 
+    # права: недостающие политики добавляем сразу (ключом пользователя, если
+    # может; иначе причина останется в логе)
+    rup_rights_preflight "$name"
+
     # --- канал (принудительно, если задан UPDATE_CHANNEL) ---
     if [ -n "$chan_cfg" ]; then
         rup_ssh_exec "$name" "/system package update set channel=$chan_cfg" "${UPDATE_SSH_TIMEOUT:-60}" > /dev/null 2>&1
@@ -410,7 +518,9 @@ rup_check_device() {
     # поэтому ограничиваем по времени, чтобы одно устройство не блокировало все.
     out=$(rup_ssh_exec "$name" $'/system package update check-for-updates\n/system package update print' "${UPDATE_CHECK_TIMEOUT:-150}")
     rc=$?
-    if [ $rc -ne 0 ]; then
+    if [ $rc -eq 0 ] && printf '%s' "$out" | grep -qiE 'not enough permissions|permission denied'; then
+        detail="роутер отказал по правам (not enough permissions) — группе пользователя нужны политики write,policy,test,reboot"
+    elif [ $rc -ne 0 ]; then
         if [ "$rc" -eq 124 ]; then
             detail="check-for-updates не ответил за ${UPDATE_CHECK_TIMEOUT:-150}с (нет доступа роутера к upgrade.mikrotik.com?)"
         else
@@ -587,22 +697,43 @@ $(rup_report_summary "$all_tsv")"
 # ПРЕДВАРИТЕЛЬНОЕ РЕЗЕРВНОЕ КОПИРОВАНИЕ (MikroGit.sh)
 # -----------------------------------------------------------------------------
 rup_backup_before_update() {
-    # $1 - device_name
-    local name="$1"
-    [ "${UPDATE_BACKUP_BEFORE_APPLY:-1}" = "1" ] || return 0
+    # $1 - device_name, $2 - причина (RouterOS install / RouterBOOT), $3 - 1 = обязательно
+    local name="$1" reason="${2:-обновление}" required="${3:-1}"
+    [ "${UPDATE_BACKUP_BEFORE_APPLY:-1}" = "1" ] || {
+        rup_send "ℹ️ <b>$name</b>: бэкап перед обновлением отключён (<code>UPDATE_BACKUP_BEFORE_APPLY=0</code>)."
+        return 0
+    }
     local bs="${BACKUP_SCRIPT:-}"
     if [ -z "$bs" ] || [ ! -f "$bs" ]; then
         rup_log "BACKUP_SCRIPT не задан/не найден ($bs) — пропускаю предварительный бэкап"
+        if [ "$required" = "1" ]; then
+            rup_send "⚠️ <b>$name</b>: не задан <code>BACKUP_SCRIPT</code> — бэкап перед обновлением не сделан."
+            return 1
+        fi
         return 0
     fi
-    rup_send "🗄 Делаю резервную копию конфигурации <b>$name</b> перед обновлением…"
-    if bash "$bs" --device "$name" >> "${LOG_FILE:-/tmp/mk_updates.log}" 2>&1; then
-        rup_send "✅ Конфигурация <b>$name</b> сохранена (MikroGit)."
-        return 0
-    else
-        rup_send "⚠️ Не удалось создать резервную копию <b>$name</b>."
+    rup_send "🛡 <b>$name</b>: делаю резервную копию <b>.backup</b> перед $reason…\nФайл: <code>$(basename "${BACKUP_DIR:-bckp}")/$name/${name}_pre_update_&lt;дата&gt;.backup</code>"
+    local out rc
+    out=$(bash "$bs" --device "$name" --pre-update 2>&1)
+    rc=$?
+    rup_log "pre-update backup $name rc=$rc: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
+    if [ "$rc" -ne 0 ]; then
+        rup_send "⚠️ Не удалось создать резервную копию <b>$name</b> перед $reason (rc=$rc).\nПоследние строки:\n<code>$(printf '%s' "$out" | tail -3 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')</code>"
         return 1
     fi
+    local latest="" dir
+    dir="${BACKUP_DIR:-}/$name"
+    if declare -f bkl_latest > /dev/null 2>&1; then
+        latest=$(bkl_latest "$dir" pre)
+    else
+        latest=$(ls -1t "$dir"/*pre_update*.backup 2>/dev/null | head -1)
+    fi
+    if [ -n "$latest" ] && [ -f "$latest" ]; then
+        rup_send "✅ Бэкап <b>$name</b> сохранён:\n<code>$latest</code>\n($(du -h "$latest" 2>/dev/null | cut -f1), 🛡 pre_update — доступен в боте: 📥 Download → 🛡 Перед обновлением)"
+        return 0
+    fi
+    rup_send "✅ Конфигурация <b>$name</b> сохранена (MikroGit): <code>$dir</code>"
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -611,6 +742,7 @@ rup_backup_before_update() {
 rup_worker_apply() {
     local name="$1"
     rup_ensure_dirs
+    RUP_CUR_DEV="$name"
 
     if ! rup_lock_acquire "apply_$name" 3; then
         rup_busy_message "$name"
@@ -653,7 +785,7 @@ rup_worker_apply() {
     fi
 
     # 2. Подтверждено пользователем — резервная копия
-    if ! rup_backup_before_update "$name"; then
+    if ! rup_backup_before_update "$name" "установкой RouterOS $latest" 1; then
         rup_send "🛑 <b>$name</b>: установка отменена (резервная копия не создана)."
         rup_lock_release "apply_$name"; trap - EXIT; return 1
     fi
@@ -667,6 +799,14 @@ rup_worker_apply() {
     # 4. Скачивание
     rup_send "⬇️ <b>$name</b>: скачиваю RouterOS $latest (канал ${chan:-?}).\nЭто может занять несколько минут…"
     local out rc
+    # 4a. Право на reboot: без него пакет скачается, но установка не завершится
+    if ! rup_has_reboot_policy "$name"; then
+        rup_send "⏸ <b>$name</b>: обновление НЕ начинаю — ${RUP_REBOOT_WHY:-нет права на перезагрузку}.\nБез <code>reboot</code> роутер не перезагрузится сам, и новый RouterOS не встанет.\nВключить: <code>/user group set [find name=<группа>] policy=<текущие>,reboot</code> — или обновите устройство вручную (Winbox/консоль)."
+        rup_note_error "$name" "нет политики reboot у пользователя — установка не начнётся"
+        rup_log "apply $name: пропуск — ${RUP_REBOOT_WHY}"
+        rup_lock_release "apply_$name"; trap - EXIT; return 1
+    fi
+
     out=$(rup_ssh_exec "$name" "/system package update download" "${UPDATE_DOWNLOAD_TIMEOUT:-900}")
     rc=$?
 
@@ -826,6 +966,7 @@ rup_rb_after_apply() {
 # ВОРКЕР: отдельное обновление RouterBOOT firmware на устройстве
 # (когда RouterOS уже актуален, а загрузчик — нет)
 rup_worker_rb() {
+    RUP_CUR_DEV="${1:-}"
     local name="$1"
     rup_ensure_dirs
 
@@ -854,6 +995,9 @@ rup_worker_rb() {
         return 0
     fi
     rup_send "🔩 <b>$name</b>: доступно обновление RouterBOOT firmware (<b>$cur → $upg</b>)."
+    if [ "${UPDATE_BACKUP_BEFORE_RB:-1}" = "1" ] && [ "${UPDATE_BACKUP_BEFORE_APPLY:-1}" = "1" ]; then
+        rup_backup_before_update "$name" "обновлением RouterBOOT firmware" 0 || true
+    fi
     rup_rb_exec_upgrade "$name" "$upg"
     local rc=$?
     rup_lock_release "apply_$name"; trap - EXIT
@@ -922,6 +1066,7 @@ rup_worker_update_all() {
         return 1
     fi
     rup_stop_clear
+    rup_errors_reset
     local -a names=()
     local name
     while IFS= read -r name; do
@@ -929,6 +1074,7 @@ rup_worker_update_all() {
     done < <(rup_ordered_names)
     local total=${#names[@]}
     if [ "$total" = 0 ]; then
+        RUP_CUR_DEV=""
         rup_send "❌ Нет устройств в devices.conf."
         rup_lock_release "update_all"
         return 1
@@ -942,6 +1088,7 @@ rup_worker_update_all() {
             break
         fi
         n=$((n+1))
+        RUP_CUR_DEV="$name"
         rup_send_stop "▶️ [$n/$total] <b>$name</b>: начинаю (проверка состояния)…"
         tsv=$(rup_check_device "$name")
         IFS=$'\t' read -r _ status _ _ _ _ det <<< "$tsv"
@@ -960,10 +1107,13 @@ rup_worker_update_all() {
         esac
         rup_send "✅ [$n/$total] <b>$name</b>: обработан. Перехожу к следующему…"
     done
+    local why
+    why=$(rup_errors_block 6)
+    RUP_CUR_DEV=""
     if [ "$stopped" = "1" ]; then
-        rup_send "🛑 <b>Обновление всех остановлено пользователем</b> (после $n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err"
+        rup_send "🛑 <b>Обновление всех остановлено пользователем</b> (после $n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err${why:+\n\n<b>Почему не вышло:</b>\n$why}"
     else
-        rup_send "📊 <b>Обновление всех завершено</b> ($n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err"
+        rup_send "📊 <b>Обновление всех завершено</b> ($n/$total): успешно ✅ $ok • пропущено ⏭️ $skp • ошибки ⚠️ $err${why:+\n\n<b>Почему не вышло:</b>\n$why}"
     fi
     rup_stop_clear
     rup_lock_release "update_all"
@@ -975,9 +1125,11 @@ rup_worker_apply_list() {
     rup_ensure_dirs
     local listf="$(rup_state_dir)/apply_list.txt"
     if [ ! -s "$listf" ]; then
+        RUP_CUR_DEV=""
         rup_send "❌ Список устройств для обновления пуст."
         return 1
     fi
+    rup_errors_reset
     if ! rup_lock_acquire update_all 5; then
         rup_busy_message "обновление выбранных устройств"
         return 1
@@ -995,6 +1147,7 @@ rup_worker_apply_list() {
     for name in "${names[@]}"; do
         if rup_stop_requested; then rup_stop_clear; stopped=1; break; fi
         n=$((n+1))
+        RUP_CUR_DEV="$name"
         rup_send_stop "▶️ [$n/$total] <b>$name</b>…"
         tsv=$(rup_check_device "$name")
         IFS=$'\t' read -r _ status _ _ _ _ det <<< "$tsv"
@@ -1009,10 +1162,13 @@ rup_worker_apply_list() {
                 err=$((err+1)); rup_send "⚠️ [$n/$total] <b>$name</b>: ${det:-ошибка} — пропущен." ;;
         esac
     done
+    local why2
+    why2=$(rup_errors_block 6)
+    RUP_CUR_DEV=""
     if [ "$stopped" = "1" ]; then
-        rup_send "🛑 Выборочное обновление остановлено ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err"
+        rup_send "🛑 Выборочное обновление остановлено ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err${why2:+\n\n<b>Почему не вышло:</b>\n$why2}"
     else
-        rup_send "📊 <b>Выборочное обновление завершено</b> ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err"
+        rup_send "📊 <b>Выборочное обновление завершено</b> ($n/$total): ✅ $ok • ⏭️ $skp • ⚠️ $err${why2:+\n\n<b>Почему не вышло:</b>\n$why2}"
     fi
     rup_stop_clear
     rup_lock_release "update_all"

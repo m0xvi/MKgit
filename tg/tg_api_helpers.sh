@@ -22,11 +22,27 @@ TG_RETRY_DELAY="${TG_RETRY_DELAY:-2}"
 TG_TIMEOUT="${TG_TIMEOUT:-30}"
 
 # --- Logging (stderr) ---
+# Если stderr уже перенаправлен в LOG_FILE (бот запускает скрипт как
+# `>> LOG_FILE 2>&1`), вторую запись не делаем — иначе строки дублируются.
+_tg_log_file_is_stderr() {
+    local lf="${LOG_FILE:-}"
+    [ -n "$lf" ] && [ -f "$lf" ] && [ -e /proc/$$/fd/2 ] || return 1
+    [ "$(readlink -f "$lf" 2>/dev/null)" = "$(readlink -f /proc/$$/fd/2 2>/dev/null)" ]
+}
+# Скрыть логин:пароль внутри URL прокси/ссылок (http://user:pass@host → http://***@host)
+tg_mask_secrets() {
+    printf '%s' "$1" | sed -E 's#(://)[^/@[:space:]]+:[^/@[:space:]]*@#\1***@#g'
+}
+
 tg_api_log() {
     local level="${1:-}"; shift
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] TG_API [$level]: $*"
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] TG_API [$level]: $(tg_mask_secrets "$*")"
     echo "$msg" >&2
-    echo "$msg" >> "${LOG_FILE:-/tmp/tg_api.log}"
+    if ! _tg_log_file_is_stderr; then
+        local lf="${LOG_FILE:-/tmp/tg_api.log}"
+        [ -d "$(dirname "$lf")" ] || mkdir -p "$(dirname "$lf")" 2>/dev/null || true
+        echo "$msg" >> "$lf" 2>/dev/null || true
+    fi
 }
 
 # ==== CORE API CALL ====
@@ -184,5 +200,6 @@ tg_test_connection() {
     return 1
 }
 
-tg_api_log "INFO" "Helpers loaded. https_proxy=${https_proxy:-DIRECT}"
+_mk_proxy="${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}"
+tg_api_log "INFO" "Helpers loaded. proxy=${_mk_proxy:-DIRECT}"
 

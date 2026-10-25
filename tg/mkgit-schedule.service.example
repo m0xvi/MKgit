@@ -1,0 +1,41 @@
+# =============================================================================
+# systemd unit: планировщик MikroGit (бэкап ежедневно + обновления раз в неделю)
+# -----------------------------------------------------------------------------
+# Работает НЕЗАВИСИМО от бота: расписание не сбивается при перезапуске бота.
+# Бот при старте тоже поднимает демон, но его останавливает flock — второй
+# экземпляр просто завершается, так что дублей не будет.
+#
+# Установка:
+#   sudo cp tg/mkgit-schedule.service.example /etc/systemd/system/mkgit-schedule.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mkgit-schedule
+#   bash tg/mk_schedule.sh status          # проверить план и живость демона
+#   journalctl -u mkgit-schedule -f
+#
+# Настройки расписания меняются из бота (меню «🗓 Расписание») и хранятся в
+# logs/schedule/schedule.conf — перезапуск сервиса не нужен.
+# =============================================================================
+
+[Unit]
+Description=MikroGit schedule daemon (daily backup + weekly RouterOS updates)
+After=network-online.target
+Wants=network-online.target
+# если бот/планировщик уже запущен вручную, systemd не должен
+# перезапускать сервис бесконечно — после 5 попыток за 5 минут он сдаётся
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=aionis
+Group=aionis
+WorkingDirectory=/home/aionis/MikroGit/tg
+Environment=HOME=/home/aionis
+ExecStart=/bin/bash -c 'source /home/aionis/MikroGit/tg/tg_bot_config.sh; exec bash /home/aionis/MikroGit/tg/mk_schedule.sh daemon'
+Restart=on-failure
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
